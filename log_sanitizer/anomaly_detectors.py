@@ -37,6 +37,7 @@ class BaseDetector:
         self.current_line_start: int = 0
         self.current_line_end: int = 0
         self.threshold_overrides: Dict[str, float] = {}
+        self._wall_clock_mode: bool = False
 
     def set_line_range(self, start: int, end: int) -> None:
         self.current_line_start = start
@@ -47,6 +48,15 @@ class BaseDetector:
 
     def get_effective_threshold(self, source: str, base_value: float) -> float:
         return self.threshold_overrides.get(source, base_value)
+
+    def enable_wall_clock_mode(self) -> None:
+        self._wall_clock_mode = True
+
+    def check_windows_by_wallclock(self) -> None:
+        raise NotImplementedError
+
+    def get_window_stats(self, source: str) -> Dict[str, Any]:
+        return {}
 
     def _apply_weight_to_severity(self, severity: AlertSeverity) -> AlertSeverity:
         weight = getattr(self.config, 'weight', 1.0)
@@ -186,6 +196,37 @@ class FrequencyDetector(BaseDetector):
             last_update=datetime.fromisoformat(state_dict['last_update']) if state_dict.get('last_update') else None,
         )
         self.states[source] = state
+
+    def check_windows_by_wallclock(self) -> None:
+        if not self._wall_clock_mode:
+            return
+        
+        now = datetime.now(timezone.utc)
+        window_size = timedelta(seconds=self.config.window_size_seconds)
+        
+        for source in list(self.states.keys()):
+            state = self.states[source]
+            if state.window_start is None:
+                continue
+            
+            time_diff = now - state.window_start
+            if time_diff >= window_size:
+                self.force_check_window(source)
+                state.window_start = now
+                state.window_count = 0
+                state.last_update = now
+
+    def get_window_stats(self, source: str) -> Dict[str, Any]:
+        if source not in self.states:
+            return {}
+        
+        state = self.states[source]
+        return {
+            "ewma": state.ewma,
+            "window_count": state.window_count,
+            "window_start": state.window_start.isoformat() if state.window_start else None,
+            "window_size_seconds": self.config.window_size_seconds,
+        }
 
 
 def calculate_modified_z_score(values: List[float], current_value: float) -> float:
@@ -334,6 +375,39 @@ class ErrorRateDetector(BaseDetector):
             window_errors=state_dict.get('window_errors', 0),
         )
         self.states[source] = state
+
+    def check_windows_by_wallclock(self) -> None:
+        if not self._wall_clock_mode:
+            return
+        
+        now = datetime.now(timezone.utc)
+        window_size = timedelta(seconds=self.config.window_size_seconds)
+        
+        for source in list(self.states.keys()):
+            state = self.states[source]
+            if state.window_start is None:
+                continue
+            
+            time_diff = now - state.window_start
+            if time_diff >= window_size:
+                self.force_check_window(source)
+                state.window_start = now
+                state.window_total = 0
+                state.window_errors = 0
+
+    def get_window_stats(self, source: str) -> Dict[str, Any]:
+        if source not in self.states:
+            return {}
+        
+        state = self.states[source]
+        return {
+            "error_rate_history": list(state.history),
+            "window_total": state.window_total,
+            "window_errors": state.window_errors,
+            "window_start": state.window_start.isoformat() if state.window_start else None,
+            "window_size_seconds": self.config.window_size_seconds,
+            "z_score_threshold": self.config.z_score_threshold,
+        }
 
 
 def _is_path_variable(segment: str) -> bool:
@@ -500,3 +574,35 @@ class PatternDetector(BaseDetector):
         self.states[source] = state
         if source not in self._window_templates:
             self._window_templates[source] = set()
+
+    def check_windows_by_wallclock(self) -> None:
+        if not self._wall_clock_mode:
+            return
+        
+        now = datetime.now(timezone.utc)
+        window_size = timedelta(seconds=self.config.window_size_seconds)
+        
+        for source in list(self.states.keys()):
+            state = self.states[source]
+            if state.window_start is None:
+                continue
+            
+            time_diff = now - state.window_start
+            if time_diff >= window_size:
+                self.force_check_window(source)
+                state.window_start = now
+                if source in self._window_templates:
+                    self._window_templates[source] = set()
+
+    def get_window_stats(self, source: str) -> Dict[str, Any]:
+        if source not in self.states:
+            return {}
+        
+        state = self.states[source]
+        return {
+            "known_templates_count": len(state.known_templates),
+            "total_count": state.total_count,
+            "window_templates_count": len(self._window_templates.get(source, set())),
+            "window_start": state.window_start.isoformat() if state.window_start else None,
+            "window_size_seconds": self.config.window_size_seconds,
+        }

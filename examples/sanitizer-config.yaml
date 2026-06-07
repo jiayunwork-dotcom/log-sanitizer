@@ -159,3 +159,14 @@ anomaly_detection:
     max_retries: 2
     retry_interval_seconds: 1
     dead_letter_file: "./output/webhook_dead_letter.jsonl"
+
+stream:
+  enabled: true
+  high_watermark: 10000
+  low_watermark: 5000
+  drain_timeout: 30
+  checkpoint_interval: 60
+  heartbeat_interval: 30
+  tail:
+    poll_interval: 0.5
+    max_line_length: 65536

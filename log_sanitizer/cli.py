@@ -11,6 +11,7 @@ from .config import ConfigLoader, PipelineConfig
 from .processor import LogProcessor
 from .report import ReportGenerator
 from .models import LogFormat, SanitizeStrategy
+from .stream_processor import StreamProcessor
 
 app = typer.Typer(
     help="批量日志文件脱敏与格式标准化命令行工具",
@@ -341,6 +342,18 @@ anomaly_detection:
     max_retries: 2  # 失败后最大重试次数
     retry_interval_seconds: 1  # 重试间隔
     dead_letter_file: "./output/webhook_dead_letter.jsonl"  # 重试失败后的死信文件
+
+# 流式处理配置
+stream:
+  enabled: true  # 是否启用流式处理模式
+  high_watermark: 10000  # 背压高水位，队列积压超过此值时暂停读取
+  low_watermark: 5000  # 背压低水位，队列降到此值以下时恢复读取
+  drain_timeout: 30  # 优雅退出等待超时秒数
+  checkpoint_interval: 60  # 状态自动保存间隔秒数
+  heartbeat_interval: 30  # 心跳信息输出间隔秒数
+  tail:
+    poll_interval: 0.5  # tail模式下文件轮询间隔秒数
+    max_line_length: 65536  # 最大行长度，超过则截断
 """
     
     with open(output, 'w', encoding='utf-8') as f:
@@ -1085,6 +1098,205 @@ def anomaly_alerts(
 
         console.print(table)
 
+    except Exception as e:
+        console.print(f"[bold red]错误:[/bold red] {str(e)}")
+        raise typer.Exit(code=1)
+
+
+stream_app = typer.Typer(
+    help="实时日志流处理模式",
+    no_args_is_help=True,
+)
+
+app.add_typer(stream_app, name="stream", help="实时日志流处理")
+
+
+def _apply_stream_options(
+    pipeline_config: PipelineConfig,
+    high_watermark: Optional[int],
+    low_watermark: Optional[int],
+    drain_timeout: Optional[int],
+    checkpoint_interval: Optional[int],
+    heartbeat_interval: Optional[int],
+) -> None:
+    if high_watermark is not None:
+        pipeline_config.stream.high_watermark = high_watermark
+    if low_watermark is not None:
+        pipeline_config.stream.low_watermark = low_watermark
+    if drain_timeout is not None:
+        pipeline_config.stream.drain_timeout = drain_timeout
+    if checkpoint_interval is not None:
+        pipeline_config.stream.checkpoint_interval = checkpoint_interval
+    if heartbeat_interval is not None:
+        pipeline_config.stream.heartbeat_interval = heartbeat_interval
+
+    if pipeline_config.stream.low_watermark >= pipeline_config.stream.high_watermark:
+        raise typer.BadParameter(
+            f"low_watermark ({pipeline_config.stream.low_watermark}) must be less than "
+            f"high_watermark ({pipeline_config.stream.high_watermark})"
+        )
+
+
+@stream_app.command("pipe")
+def stream_pipe(
+    config: Path = typer.Option(
+        ...,
+        "--config",
+        "-c",
+        help="Pipeline配置文件路径(YAML格式)",
+        exists=True,
+        readable=True,
+    ),
+    output: str = typer.Option(
+        "stdout",
+        "--output",
+        "-o",
+        help="输出目标: stdout 或 文件路径",
+    ),
+    buffer_size: int = typer.Option(
+        1000,
+        "--buffer-size",
+        help="输入缓冲区大小(行数)",
+    ),
+    high_watermark: Optional[int] = typer.Option(
+        None,
+        "--high-watermark",
+        help="背压高水位(默认10000)",
+    ),
+    low_watermark: Optional[int] = typer.Option(
+        None,
+        "--low-watermark",
+        help="背压低水位(默认5000)",
+    ),
+    drain_timeout: Optional[int] = typer.Option(
+        None,
+        "--drain-timeout",
+        help="优雅退出等待超时秒数(默认30)",
+    ),
+    checkpoint_interval: Optional[int] = typer.Option(
+        None,
+        "--checkpoint-interval",
+        help="状态保存间隔秒数(默认60)",
+    ),
+    heartbeat_interval: Optional[int] = typer.Option(
+        None,
+        "--heartbeat-interval",
+        help="心跳输出间隔秒数(默认30)",
+    ),
+):
+    """
+    从stdin管道读取日志流并实时处理
+    示例: cat /var/log/app.log | log-sanitizer stream pipe --config config.yaml
+    """
+    try:
+        pipeline_config = ConfigLoader.load(str(config))
+        
+        _apply_stream_options(
+            pipeline_config,
+            high_watermark,
+            low_watermark,
+            drain_timeout,
+            checkpoint_interval,
+            heartbeat_interval,
+        )
+        
+        pipeline_config.stream.enabled = True
+        
+        output_target = output if output != "stdout" else "stdout"
+        
+        processor = StreamProcessor(pipeline_config, output_target=output_target)
+        processor.run_pipe(buffer_size=buffer_size)
+        
+    except typer.BadParameter:
+        raise
+    except Exception as e:
+        console.print(f"[bold red]错误:[/bold red] {str(e)}")
+        raise typer.Exit(code=1)
+
+
+@stream_app.command("tail")
+def stream_tail(
+    config: Path = typer.Option(
+        ...,
+        "--config",
+        "-c",
+        help="Pipeline配置文件路径(YAML格式)",
+        exists=True,
+        readable=True,
+    ),
+    file: List[Path] = typer.Option(
+        ...,
+        "--file",
+        "-f",
+        help="要跟踪的文件路径，可多次指定",
+    ),
+    output: str = typer.Option(
+        "stdout",
+        "--output",
+        "-o",
+        help="输出目标: stdout 或 文件路径",
+    ),
+    buffer_size: int = typer.Option(
+        1000,
+        "--buffer-size",
+        help="输入缓冲区大小(行数)",
+    ),
+    high_watermark: Optional[int] = typer.Option(
+        None,
+        "--high-watermark",
+        help="背压高水位(默认10000)",
+    ),
+    low_watermark: Optional[int] = typer.Option(
+        None,
+        "--low-watermark",
+        help="背压低水位(默认5000)",
+    ),
+    drain_timeout: Optional[int] = typer.Option(
+        None,
+        "--drain-timeout",
+        help="优雅退出等待超时秒数(默认30)",
+    ),
+    checkpoint_interval: Optional[int] = typer.Option(
+        None,
+        "--checkpoint-interval",
+        help="状态保存间隔秒数(默认60)",
+    ),
+    heartbeat_interval: Optional[int] = typer.Option(
+        None,
+        "--heartbeat-interval",
+        help="心跳输出间隔秒数(默认30)",
+    ),
+):
+    """
+    跟踪指定文件的追加内容并实时处理(类似tail -f)
+    示例: log-sanitizer stream tail --file /var/log/app.log --config config.yaml
+    """
+    try:
+        if not file:
+            raise typer.BadParameter("至少指定一个文件路径")
+        
+        file_paths = [str(p) for p in file]
+        
+        pipeline_config = ConfigLoader.load(str(config))
+        
+        _apply_stream_options(
+            pipeline_config,
+            high_watermark,
+            low_watermark,
+            drain_timeout,
+            checkpoint_interval,
+            heartbeat_interval,
+        )
+        
+        pipeline_config.stream.enabled = True
+        
+        output_target = output if output != "stdout" else "stdout"
+        
+        processor = StreamProcessor(pipeline_config, output_target=output_target)
+        processor.run_tail(file_paths=file_paths)
+        
+    except typer.BadParameter:
+        raise
     except Exception as e:
         console.print(f"[bold red]错误:[/bold red] {str(e)}")
         raise typer.Exit(code=1)

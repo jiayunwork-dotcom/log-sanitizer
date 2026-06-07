@@ -183,6 +183,30 @@ class AnomalyDetectionConfig:
 
 
 @dataclass
+class StreamTailConfig:
+    poll_interval: float = 0.5
+    max_line_length: int = 65536
+
+
+@dataclass
+class StreamConfig:
+    enabled: bool = False
+    high_watermark: int = 10000
+    low_watermark: int = 5000
+    drain_timeout: int = 30
+    checkpoint_interval: int = 60
+    heartbeat_interval: int = 30
+    tail: StreamTailConfig = field(default_factory=StreamTailConfig)
+
+    def __post_init__(self):
+        if self.low_watermark >= self.high_watermark:
+            raise ValueError(
+                f"low_watermark ({self.low_watermark}) must be less than "
+                f"high_watermark ({self.high_watermark})"
+            )
+
+
+@dataclass
 class PipelineConfig:
     name: str = "default"
     inputs: InputConfig = field(default_factory=InputConfig)
@@ -198,6 +222,7 @@ class PipelineConfig:
     incremental: bool = False
     audit_log: AuditLogConfig = field(default_factory=AuditLogConfig)
     anomaly_detection: AnomalyDetectionConfig = field(default_factory=AnomalyDetectionConfig)
+    stream: StreamConfig = field(default_factory=StreamConfig)
     config_path: Optional[str] = None
 
 
@@ -447,6 +472,23 @@ class ConfigLoader:
                 )
 
             pipeline.anomaly_detection = ad_config
+
+        stream_data = config_data.get('stream', {})
+        if stream_data:
+            tail_data = stream_data.get('tail', {})
+            stream_tail_config = StreamTailConfig(
+                poll_interval=float(tail_data.get('poll_interval', 0.5)),
+                max_line_length=int(tail_data.get('max_line_length', 65536)),
+            )
+            pipeline.stream = StreamConfig(
+                enabled=bool(stream_data.get('enabled', False)),
+                high_watermark=int(stream_data.get('high_watermark', 10000)),
+                low_watermark=int(stream_data.get('low_watermark', 5000)),
+                drain_timeout=int(stream_data.get('drain_timeout', 30)),
+                checkpoint_interval=int(stream_data.get('checkpoint_interval', 60)),
+                heartbeat_interval=int(stream_data.get('heartbeat_interval', 30)),
+                tail=stream_tail_config,
+            )
 
         return pipeline
 
