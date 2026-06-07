@@ -167,6 +167,18 @@ stream:
   drain_timeout: 30
   checkpoint_interval: 60
   heartbeat_interval: 30
+  # metrics文件路径(JSON格式)，每个checkpoint周期结束时写入
+  metrics_file: "./output/stream_metrics.json"
+  # 条件路由规则：按日志级别将输出路由到不同目标
+  # 匹配时按规则列表顺序，第一条命中即路由到对应目标
+  # 未命中任何规则的走默认输出
+  route_rules:
+    - level_match: "ERROR,CRITICAL"
+      output_target: "./output/error_logs.jsonl"
+    - level_match: "WARN,WARNING"
+      output_target: "./output/warn_logs.jsonl"
+    - level_match: "INFO"
+      output_target: "stdout"
   tail:
     poll_interval: 0.5
     max_line_length: 65536

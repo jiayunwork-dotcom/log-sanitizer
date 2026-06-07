@@ -24,18 +24,26 @@ from .stream_sources import StreamInputSource, PipeInputSource, TailInputSource
 @dataclass
 class StreamStatus:
     processed_lines: int = 0
+    source_processed_lines: Dict[str, int] = field(default_factory=dict)
+    source_sanitization_hits: Dict[str, Dict[str, int]] = field(default_factory=dict)
     queue_depth: int = 0
+    queue_depth_history: List[Tuple[float, int]] = field(default_factory=list)
     backpressure_paused: bool = False
+    backpressure_trigger_count: int = 0
+    backpressure_total_pause_seconds: float = 0.0
+    backpressure_last_trigger_time: Optional[float] = None
     last_alert_time: Optional[datetime] = None
     detector_summaries: Dict[str, Any] = field(default_factory=dict)
     start_time: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class StreamProcessor:
-    def __init__(self, config: PipelineConfig, output_target: str = "stdout"):
+    def __init__(self, config: PipelineConfig, output_target: str = "stdout", watch_list_path: Optional[str] = None):
         self.config = config
         self.output_target = output_target
         self._stream_config = config.stream
+        self._watch_list_path = watch_list_path
+        self._watch_list_mtime: Optional[float] = None
         
         self._processing_queue: queue.Queue[Optional[Tuple[str, str]]] = queue.Queue(
             maxsize=config.stream.high_watermark * 2
@@ -56,13 +64,19 @@ class StreamProcessor:
         self._backpressure_event.set()
         
         self._output_lock = threading.Lock()
-        self._output_handle = self._open_output()
+        self._output_handles: Dict[str, Any] = {}
+        self._output_locks: Dict[str, threading.Lock] = {}
+        self._default_output_target = output_target
+        self._route_rules = config.stream.route_rules
+        self._open_output_handle(output_target)
         
         self._threads: List[threading.Thread] = []
         self._worker_thread: Optional[threading.Thread] = None
         self._window_timer_thread: Optional[threading.Thread] = None
         self._checkpoint_thread: Optional[threading.Thread] = None
         self._heartbeat_thread: Optional[threading.Thread] = None
+        self._watch_list_thread: Optional[threading.Thread] = None
+        self._queue_sampler_thread: Optional[threading.Thread] = None
         
         self.detector = self._create_detector()
         self.mapping_manager = self._create_mapping_manager()
@@ -94,6 +108,20 @@ class StreamProcessor:
                 self._update_last_alert_time()
                 original_write(alert)
             self.anomaly_engine.alert_output.write_alert = wrapped_write
+    
+    def _open_output_handle(self, target: str) -> None:
+        if target in self._output_handles:
+            return
+        
+        self._output_locks[target] = threading.Lock()
+        
+        if target == "stdout":
+            self._output_handles[target] = sys.stdout
+        else:
+            output_dir = os.path.dirname(os.path.abspath(target))
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+            self._output_handles[target] = open(target, 'a', encoding=self.config.output.encoding, buffering=1)
 
     def _enable_wall_clock_mode(self) -> None:
         if not self.anomaly_engine:
@@ -148,14 +176,16 @@ class StreamProcessor:
             in_memory=sanitizers.mapping_in_memory or sanitizers.mapping_db_path is None,
         )
 
-    def _open_output(self):
-        if self.output_target == "stdout":
-            return sys.stdout
-        else:
-            output_dir = os.path.dirname(os.path.abspath(self.output_target))
-            if output_dir:
-                os.makedirs(output_dir, exist_ok=True)
-            return open(self.output_target, 'a', encoding=self.config.output.encoding, buffering=1)
+    def _get_route_target(self, entry: LogEntry) -> str:
+        entry_level = entry.level.value.upper() if entry.level else "UNKNOWN"
+        
+        for rule in self._route_rules:
+            levels = [l.strip().upper() for l in rule.level_match.split(',')]
+            if entry_level in levels:
+                self._open_output_handle(rule.output_target)
+                return rule.output_target
+        
+        return self._default_output_target
 
     def _get_parser(self, source: str) -> LogParser:
         if source not in self._parser_cache:
@@ -169,12 +199,15 @@ class StreamProcessor:
 
     def _check_backpressure(self) -> None:
         current_depth = self._processing_queue.qsize()
+        self.status.queue_depth = current_depth
         
         with self._backpressure_lock:
             if not self._backpressure_paused and current_depth >= self._stream_config.high_watermark:
                 self._backpressure_paused = True
                 self._backpressure_event.clear()
                 self.status.backpressure_paused = True
+                self.status.backpressure_trigger_count += 1
+                self.status.backpressure_last_trigger_time = time.monotonic()
                 print(
                     f"[WARNING] Backpressure activated: queue depth {current_depth} >= high_watermark {self._stream_config.high_watermark}, pausing input reading",
                     file=sys.stderr,
@@ -184,11 +217,26 @@ class StreamProcessor:
                 self._backpressure_paused = False
                 self._backpressure_event.set()
                 self.status.backpressure_paused = False
+                if self.status.backpressure_last_trigger_time is not None:
+                    pause_duration = time.monotonic() - self.status.backpressure_last_trigger_time
+                    self.status.backpressure_total_pause_seconds += pause_duration
+                    self.status.backpressure_last_trigger_time = None
                 print(
                     f"[INFO] Backpressure released: queue depth {current_depth} <= low_watermark {self._stream_config.low_watermark}, resuming input reading",
                     file=sys.stderr,
                     flush=True
                 )
+
+    def _sample_queue_depth(self) -> None:
+        current_depth = self._processing_queue.qsize()
+        now = time.time()
+        with self._status_lock:
+            self.status.queue_depth_history.append((now, current_depth))
+            cutoff_time = now - 60.0
+            self.status.queue_depth_history = [
+                (t, d) for t, d in self.status.queue_depth_history
+                if t >= cutoff_time
+            ][-60:]
 
     def _queue_put(self, source: str, line: str) -> None:
         while not self._stop_event.is_set() and not self._graceful_shutdown.is_set():
@@ -247,6 +295,16 @@ class StreamProcessor:
         
         entry, detections, sanitized, total_fields, audit_entries, field_path_counts = self.sanitizer.sanitize_entry(entry)
         
+        with self._status_lock:
+            self.status.source_processed_lines[source] = self.status.source_processed_lines.get(source, 0) + 1
+            if detections:
+                if source not in self.status.source_sanitization_hits:
+                    self.status.source_sanitization_hits[source] = {}
+                for stype, count in detections.items():
+                    type_key = stype.value if hasattr(stype, 'value') else str(stype)
+                    self.status.source_sanitization_hits[source][type_key] = \
+                        self.status.source_sanitization_hits[source].get(type_key, 0) + count
+        
         if self.audit_logger and audit_entries:
             with self._status_lock:
                 current_line = self.status.processed_lines
@@ -272,9 +330,19 @@ class StreamProcessor:
         if self.config.output.pretty:
             json_str = json.dumps(entry.to_standard_dict(), ensure_ascii=False, indent=2)
         
-        with self._output_lock:
-            self._output_handle.write(json_str + '\n')
-            self._output_handle.flush()
+        target = self._get_route_target(entry)
+        handle = self._output_handles.get(target)
+        lock = self._output_locks.get(target)
+        
+        if handle and lock:
+            with lock:
+                handle.write(json_str + '\n')
+                handle.flush()
+        else:
+            with self._output_lock:
+                default_handle = self._output_handles.get(self._default_output_target, sys.stdout)
+                default_handle.write(json_str + '\n')
+                default_handle.flush()
 
     def _worker_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -351,21 +419,156 @@ class StreamProcessor:
             self._save_checkpoint()
 
     def _save_checkpoint(self) -> None:
-        if not self.state_persistence or not self.anomaly_engine:
+        if self.state_persistence and self.anomaly_engine:
+            try:
+                self.state_persistence.mark_dirty()
+                self.state_persistence.save_state(
+                    self.anomaly_engine.frequency_detector,
+                    self.anomaly_engine.error_rate_detector,
+                    self.anomaly_engine.pattern_detector,
+                    self.anomaly_engine.suppression_engine,
+                    self.anomaly_engine.feedback_processor,
+                    force=True,
+                )
+            except Exception as e:
+                print(f"[ERROR] Error saving checkpoint: {e}", file=sys.stderr, flush=True)
+        
+        self._export_metrics()
+    
+    def _export_metrics(self) -> None:
+        metrics_file = self._stream_config.metrics_file
+        if not metrics_file:
             return
         
         try:
-            self.state_persistence.mark_dirty()
-            self.state_persistence.save_state(
-                self.anomaly_engine.frequency_detector,
-                self.anomaly_engine.error_rate_detector,
-                self.anomaly_engine.pattern_detector,
-                self.anomaly_engine.suppression_engine,
-                self.anomaly_engine.feedback_processor,
-                force=True,
-            )
+            with self._status_lock:
+                total_processed = self.status.processed_lines
+                source_lines = dict(self.status.source_processed_lines)
+                source_hits = dict(self.status.source_sanitization_hits)
+                queue_depth_series = [
+                    {"timestamp": datetime.fromtimestamp(t, tz=timezone.utc).isoformat(), "depth": d}
+                    for t, d in self.status.queue_depth_history
+                ]
+                backpressure_triggers = self.status.backpressure_trigger_count
+                backpressure_total_pause = self.status.backpressure_total_pause_seconds
+                
+                if self.status.backpressure_paused and self.status.backpressure_last_trigger_time is not None:
+                    backpressure_total_pause += time.monotonic() - self.status.backpressure_last_trigger_time
+                
+                detector_stats = {}
+                if self.anomaly_engine:
+                    sources = getattr(self.anomaly_engine, '_active_sources', set())
+                    for source in sources:
+                        source_detector_stats = {}
+                        if self.anomaly_engine.frequency_detector:
+                            freq_stats = self.anomaly_engine.frequency_detector.get_window_stats(source)
+                            if freq_stats:
+                                source_detector_stats['frequency'] = freq_stats
+                        if self.anomaly_engine.error_rate_detector:
+                            err_stats = self.anomaly_engine.error_rate_detector.get_window_stats(source)
+                            if err_stats:
+                                source_detector_stats['error_rate'] = err_stats
+                        if self.anomaly_engine.pattern_detector:
+                            pat_stats = self.anomaly_engine.pattern_detector.get_window_stats(source)
+                            if pat_stats:
+                                source_detector_stats['pattern'] = pat_stats
+                        if source_detector_stats:
+                            detector_stats[source] = source_detector_stats
+            
+            metrics = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "total_processed_lines": total_processed,
+                "source_processed_lines": source_lines,
+                "source_sanitization_hits": source_hits,
+                "queue_depth_time_series": queue_depth_series,
+                "backpressure": {
+                    "trigger_count": backpressure_triggers,
+                    "total_pause_seconds": round(backpressure_total_pause, 2),
+                    "currently_paused": self.status.backpressure_paused,
+                },
+                "detector_window_stats": detector_stats,
+            }
+            
+            metrics_dir = os.path.dirname(os.path.abspath(metrics_file))
+            if metrics_dir:
+                os.makedirs(metrics_dir, exist_ok=True)
+            
+            with open(metrics_file, 'w', encoding='utf-8') as f:
+                json.dump(metrics, f, ensure_ascii=False, indent=2)
+            
         except Exception as e:
-            print(f"[ERROR] Error saving checkpoint: {e}", file=sys.stderr, flush=True)
+            print(f"[ERROR] Error exporting metrics: {e}", file=sys.stderr, flush=True)
+    
+    def _queue_sampler_loop(self) -> None:
+        while not self._stop_event.is_set():
+            self._sample_queue_depth()
+            if self._stop_event.wait(1.0):
+                break
+    
+    def _watch_list_loop(self) -> None:
+        if not self._watch_list_path:
+            return
+        
+        check_interval = 5.0
+        while not self._stop_event.is_set():
+            try:
+                self._check_watch_list()
+            except Exception as e:
+                print(f"[ERROR] Error checking watch list: {e}", file=sys.stderr, flush=True)
+            
+            if self._stop_event.wait(check_interval):
+                break
+    
+    def _check_watch_list(self) -> None:
+        if not self._watch_list_path or not isinstance(self._input_source, TailInputSource):
+            return
+        
+        try:
+            current_mtime = os.path.getmtime(self._watch_list_path)
+        except OSError:
+            if self._watch_list_mtime is not None:
+                print(f"[WARNING] Watch list file not found: {self._watch_list_path}, keeping current list", file=sys.stderr, flush=True)
+            self._watch_list_mtime = None
+            return
+        
+        if self._watch_list_mtime is not None and current_mtime <= self._watch_list_mtime:
+            return
+        
+        self._watch_list_mtime = current_mtime
+        
+        try:
+            with open(self._watch_list_path, 'r', encoding='utf-8') as f:
+                watch_list_data = json.load(f)
+            
+            if not isinstance(watch_list_data, list):
+                raise ValueError("Watch list must be a JSON array")
+            
+            desired_files: Dict[str, str] = {}
+            for item in watch_list_data:
+                if not isinstance(item, dict):
+                    raise ValueError(f"Invalid watch list entry: {item}")
+                path = item.get('path')
+                encoding = item.get('encoding', 'utf-8')
+                if not path:
+                    raise ValueError(f"Watch list entry missing 'path': {item}")
+                desired_files[path] = encoding
+            
+        except (json.JSONDecodeError, ValueError) as e:
+            print(f"[WARNING] Failed to parse watch list: {e}, keeping current list", file=sys.stderr, flush=True)
+            return
+        
+        current_files = set(self._input_source.get_active_files())
+        desired_paths = set(desired_files.keys())
+        
+        files_to_add = desired_paths - current_files
+        files_to_remove = current_files - desired_paths
+        
+        for file_path in files_to_remove:
+            self._input_source.remove_file(file_path)
+        
+        for file_path in files_to_add:
+            encoding = desired_files[file_path]
+            self._input_source.add_file(file_path, encoding=encoding, from_end=True)
 
     def _heartbeat_loop(self) -> None:
         interval = self._stream_config.heartbeat_interval
@@ -445,6 +648,15 @@ class StreamProcessor:
         self._worker_thread.start()
         self._threads.append(self._worker_thread)
         
+        self._queue_sampler_thread = threading.Thread(target=self._queue_sampler_loop, daemon=True, name="queue-sampler")
+        self._queue_sampler_thread.start()
+        self._threads.append(self._queue_sampler_thread)
+        
+        if self._watch_list_path and isinstance(input_source, TailInputSource):
+            self._watch_list_thread = threading.Thread(target=self._watch_list_loop, daemon=True, name="watch-list")
+            self._watch_list_thread.start()
+            self._threads.append(self._watch_list_thread)
+        
         if self.anomaly_engine:
             self._window_timer_thread = threading.Thread(
                 target=self._window_timer_loop,
@@ -454,7 +666,7 @@ class StreamProcessor:
             self._window_timer_thread.start()
             self._threads.append(self._window_timer_thread)
         
-        if self._stream_config.checkpoint_interval > 0 and self.state_persistence:
+        if self._stream_config.checkpoint_interval > 0:
             self._checkpoint_thread = threading.Thread(
                 target=self._checkpoint_loop,
                 daemon=True,
@@ -504,10 +716,11 @@ class StreamProcessor:
         
         self._save_checkpoint()
         
-        with self._output_lock:
-            if self._output_handle != sys.stdout:
+        for target, handle in list(self._output_handles.items()):
+            if handle != sys.stdout:
                 try:
-                    self._output_handle.close()
+                    handle.flush()
+                    handle.close()
                 except Exception:
                     pass
         

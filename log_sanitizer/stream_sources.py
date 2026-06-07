@@ -124,17 +124,90 @@ class TailInputSource(StreamInputSource):
                  max_line_length: int = 65536,
                  state_file: Optional[str] = None):
         super().__init__(queue_put_callback, stop_event, encoding)
-        self.file_paths = file_paths
+        self.file_paths = list(file_paths)
         self.poll_interval = poll_interval
         self.max_line_length = max_line_length
         self.state_file = state_file
         self._file_states: Dict[str, TailFileState] = {}
-        self._threads: List[threading.Thread] = []
+        self._threads: Dict[str, threading.Thread] = {}
         self._file_locks: Dict[str, threading.Lock] = {}
+        self._file_stop_events: Dict[str, threading.Event] = {}
+        self._file_handles: Dict[str, object] = {}
+        self._encodings: Dict[str, str] = {}
         
         for path in file_paths:
             self._file_locks[path] = threading.Lock()
+            self._file_stop_events[path] = threading.Event()
+            self._encodings[path] = encoding
             self._init_file_state(path)
+    
+    def get_active_files(self) -> List[str]:
+        with self._lock:
+            return list(self.file_paths)
+    
+    def add_file(self, file_path: str, encoding: str = "utf-8", from_end: bool = True) -> bool:
+        with self._lock:
+            if file_path in self.file_paths:
+                return False
+            
+            self.file_paths.append(file_path)
+            self._file_locks[file_path] = threading.Lock()
+            self._file_stop_events[file_path] = threading.Event()
+            self._encodings[file_path] = encoding
+            
+            if from_end:
+                self._init_file_state(file_path)
+            else:
+                self._file_states[file_path] = TailFileState(
+                    file_path=file_path,
+                    inode=0,
+                    offset=0,
+                    file_size=0
+                )
+            
+            t = threading.Thread(
+                target=self._tail_file,
+                args=(file_path,),
+                daemon=True,
+                name=f"tail-{os.path.basename(file_path)}"
+            )
+            self._threads[file_path] = t
+            t.start()
+            
+            print(f"[INFO] Added file to tail: {file_path} (encoding={encoding})", file=sys.stderr, flush=True)
+            return True
+    
+    def remove_file(self, file_path: str) -> bool:
+        with self._lock:
+            if file_path not in self.file_paths:
+                return False
+            
+            self._file_stop_events[file_path].set()
+            
+            if file_path in self._threads:
+                self._threads[file_path].join(timeout=2.0)
+                del self._threads[file_path]
+            
+            if file_path in self._file_handles:
+                try:
+                    self._file_handles[file_path].close()
+                except Exception:
+                    pass
+                del self._file_handles[file_path]
+            
+            if file_path in self.file_paths:
+                self.file_paths.remove(file_path)
+            if file_path in self._file_states:
+                del self._file_states[file_path]
+            if file_path in self._file_locks:
+                del self._file_locks[file_path]
+            if file_path in self._file_stop_events:
+                del self._file_stop_events[file_path]
+            if file_path in self._encodings:
+                del self._encodings[file_path]
+            
+            print(f"[INFO] Removed file from tail: {file_path}", file=sys.stderr, flush=True)
+            return True
 
     def _init_file_state(self, file_path: str) -> None:
         try:
@@ -176,26 +249,28 @@ class TailInputSource(StreamInputSource):
 
     def start(self) -> None:
         for file_path in self.file_paths:
-            t = threading.Thread(
-                target=self._tail_file,
-                args=(file_path,),
-                daemon=True,
-                name=f"tail-{os.path.basename(file_path)}"
-            )
-            self._threads.append(t)
-            t.start()
+            if file_path not in self._threads or not self._threads[file_path].is_alive():
+                t = threading.Thread(
+                    target=self._tail_file,
+                    args=(file_path,),
+                    daemon=True,
+                    name=f"tail-{os.path.basename(file_path)}"
+                )
+                self._threads[file_path] = t
+                t.start()
 
     def join(self, timeout: Optional[float] = None) -> None:
-        for t in self._threads:
+        for t in list(self._threads.values()):
             t.join(timeout=timeout)
 
     def _read_new_lines(self, file_path: str, handle) -> List[Tuple[str, int]]:
         lines = []
         state = self._file_states[file_path]
+        encoding = self._encodings.get(file_path, self.encoding)
         
         try:
             handle.seek(state.offset)
-            decoder = codecs.getincrementaldecoder(self.encoding)(errors='replace')
+            decoder = codecs.getincrementaldecoder(encoding)(errors='replace')
             buffer = ''
             
             while True:
@@ -212,7 +287,7 @@ class TailInputSource(StreamInputSource):
                             )
                             remaining = remaining[:self.max_line_length]
                         if remaining.strip() or remaining:
-                            lines.append((remaining.rstrip('\r\n'), len(remaining.encode(self.encoding))))
+                            lines.append((remaining.rstrip('\r\n'), len(remaining.encode(encoding))))
                     break
                 
                 buffer += decoder.decode(chunk, final=False)
@@ -246,7 +321,7 @@ class TailInputSource(StreamInputSource):
                         line = buffer[:newline_pos]
                         buffer = buffer[newline_pos + newline_len:]
                     
-                    line_bytes = len(line.encode(self.encoding)) + newline_len
+                    line_bytes = len(line.encode(encoding)) + newline_len
                     lines.append((line, line_bytes))
                     
         except Exception as e:
@@ -258,7 +333,8 @@ class TailInputSource(StreamInputSource):
         current_handle: Optional[object] = None
         
         try:
-            while not self._stop_event.is_set():
+            file_stop = self._file_stop_events[file_path]
+            while not self._stop_event.is_set() and not file_stop.is_set():
                 if not os.path.exists(file_path):
                     if current_handle:
                         try:
@@ -266,24 +342,30 @@ class TailInputSource(StreamInputSource):
                         except Exception:
                             pass
                         current_handle = None
-                    time.sleep(self.poll_interval)
+                    if file_stop.wait(timeout=self.poll_interval):
+                        break
                     continue
                 
                 try:
                     stat = os.stat(file_path)
                 except OSError:
-                    time.sleep(self.poll_interval)
+                    if file_stop.wait(timeout=self.poll_interval):
+                        break
                     continue
                 
                 with self._file_locks[file_path]:
+                    if file_stop.is_set():
+                        break
                     state = self._file_states[file_path]
                     
                     if current_handle is None:
                         try:
                             current_handle = open(file_path, 'rb')
+                            self._file_handles[file_path] = current_handle
                         except OSError as e:
                             print(f"[WARNING] Cannot open {file_path}: {e}", file=sys.stderr, flush=True)
-                            time.sleep(self.poll_interval)
+                            if file_stop.wait(timeout=self.poll_interval):
+                                break
                             continue
                     
                     if state.inode == 0:
@@ -298,6 +380,7 @@ class TailInputSource(StreamInputSource):
                         except Exception:
                             pass
                         current_handle = open(file_path, 'rb')
+                        self._file_handles[file_path] = current_handle
                         state.inode = stat.st_ino
                         state.offset = 0
                         state.file_size = stat.st_size
@@ -308,6 +391,7 @@ class TailInputSource(StreamInputSource):
                         except Exception:
                             pass
                         current_handle = open(file_path, 'rb')
+                        self._file_handles[file_path] = current_handle
                         state.offset = 0
                         state.file_size = stat.st_size
                     else:
@@ -316,11 +400,14 @@ class TailInputSource(StreamInputSource):
                     if state.offset < stat.st_size:
                         lines = self._read_new_lines(file_path, current_handle)
                         for line_text, line_bytes in lines:
+                            if file_stop.is_set() or self._stop_event.is_set():
+                                break
                             self._queue_put(file_path, line_text)
                             self._increment_lines()
                             state.offset += line_bytes
                     
-                time.sleep(self.poll_interval)
+                if file_stop.wait(timeout=self.poll_interval):
+                    break
                 
         except Exception as e:
             print(f"[ERROR] Tail error for {file_path}: {e}", file=sys.stderr, flush=True)
@@ -330,6 +417,8 @@ class TailInputSource(StreamInputSource):
                     current_handle.close()
                 except Exception:
                     pass
+            if file_path in self._file_handles:
+                del self._file_handles[file_path]
 
     def get_states(self) -> Dict[str, TailFileState]:
         with self._lock:

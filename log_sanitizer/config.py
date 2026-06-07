@@ -183,6 +183,12 @@ class AnomalyDetectionConfig:
 
 
 @dataclass
+class StreamRouteRule:
+    level_match: str
+    output_target: str
+
+
+@dataclass
 class StreamTailConfig:
     poll_interval: float = 0.5
     max_line_length: int = 65536
@@ -196,6 +202,8 @@ class StreamConfig:
     drain_timeout: int = 30
     checkpoint_interval: int = 60
     heartbeat_interval: int = 30
+    metrics_file: Optional[str] = None
+    route_rules: List[StreamRouteRule] = field(default_factory=list)
     tail: StreamTailConfig = field(default_factory=StreamTailConfig)
 
     def __post_init__(self):
@@ -480,6 +488,16 @@ class ConfigLoader:
                 poll_interval=float(tail_data.get('poll_interval', 0.5)),
                 max_line_length=int(tail_data.get('max_line_length', 65536)),
             )
+            
+            route_rules = []
+            route_rules_data = stream_data.get('route_rules', [])
+            if route_rules_data:
+                for rule_data in route_rules_data:
+                    route_rules.append(StreamRouteRule(
+                        level_match=rule_data.get('level_match', ''),
+                        output_target=rule_data.get('output_target', ''),
+                    ))
+            
             pipeline.stream = StreamConfig(
                 enabled=bool(stream_data.get('enabled', False)),
                 high_watermark=int(stream_data.get('high_watermark', 10000)),
@@ -487,6 +505,8 @@ class ConfigLoader:
                 drain_timeout=int(stream_data.get('drain_timeout', 30)),
                 checkpoint_interval=int(stream_data.get('checkpoint_interval', 60)),
                 heartbeat_interval=int(stream_data.get('heartbeat_interval', 30)),
+                metrics_file=stream_data.get('metrics_file'),
+                route_rules=route_rules,
                 tail=stream_tail_config,
             )
 

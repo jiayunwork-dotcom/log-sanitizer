@@ -1,7 +1,8 @@
 import os
 import sys
+import time
 import typer
-from typing import Optional, List
+from typing import Optional, List, Any, Dict
 from pathlib import Path
 from rich.console import Console
 from rich.panel import Panel
@@ -10,7 +11,7 @@ from . import __version__
 from .config import ConfigLoader, PipelineConfig
 from .processor import LogProcessor
 from .report import ReportGenerator
-from .models import LogFormat, SanitizeStrategy
+from .models import LogFormat, SanitizeStrategy, LogEntry, LogLevel
 from .stream_processor import StreamProcessor
 
 app = typer.Typer(
@@ -351,6 +352,18 @@ stream:
   drain_timeout: 30  # 优雅退出等待超时秒数
   checkpoint_interval: 60  # 状态自动保存间隔秒数
   heartbeat_interval: 30  # 心跳信息输出间隔秒数
+  # metrics文件路径(JSON格式)，每个checkpoint周期结束时写入
+  # metrics_file: "./output/stream_metrics.json"
+  # 条件路由规则：按日志级别将输出路由到不同目标
+  # 匹配时按规则列表顺序，第一条命中即路由到对应目标
+  # 未命中任何规则的走默认输出
+  # route_rules:
+  #   - level_match: "ERROR,CRITICAL"
+  #     output_target: "./output/error_logs.jsonl"
+  #   - level_match: "WARN,WARNING"
+  #     output_target: "./output/warn_logs.jsonl"
+  #   - level_match: "INFO"
+  #     output_target: "stdout"
   tail:
     poll_interval: 0.5  # tail模式下文件轮询间隔秒数
     max_line_length: 65536  # 最大行长度，超过则截断
@@ -1224,8 +1237,8 @@ def stream_tail(
         exists=True,
         readable=True,
     ),
-    file: List[Path] = typer.Option(
-        ...,
+    file: Optional[List[Path]] = typer.Option(
+        None,
         "--file",
         "-f",
         help="要跟踪的文件路径，可多次指定",
@@ -1235,6 +1248,11 @@ def stream_tail(
         "--output",
         "-o",
         help="输出目标: stdout 或 文件路径",
+    ),
+    watch_list: Optional[Path] = typer.Option(
+        None,
+        "--watch-list",
+        help="监听列表JSON文件路径，用于动态管理要跟踪的文件",
     ),
     buffer_size: int = typer.Option(
         1000,
@@ -1270,12 +1288,17 @@ def stream_tail(
     """
     跟踪指定文件的追加内容并实时处理(类似tail -f)
     示例: log-sanitizer stream tail --file /var/log/app.log --config config.yaml
+    动态管理: log-sanitizer stream tail --watch-list watch_list.json --config config.yaml
     """
     try:
-        if not file:
-            raise typer.BadParameter("至少指定一个文件路径")
+        file_paths = []
+        if file:
+            file_paths = [str(p) for p in file]
         
-        file_paths = [str(p) for p in file]
+        watch_list_path = str(watch_list) if watch_list else None
+        
+        if not file_paths and not watch_list_path:
+            raise typer.BadParameter("至少指定一个文件路径 (--file) 或监听列表 (--watch-list)")
         
         pipeline_config = ConfigLoader.load(str(config))
         
@@ -1292,8 +1315,225 @@ def stream_tail(
         
         output_target = output if output != "stdout" else "stdout"
         
-        processor = StreamProcessor(pipeline_config, output_target=output_target)
+        processor = StreamProcessor(
+            pipeline_config,
+            output_target=output_target,
+            watch_list_path=watch_list_path
+        )
         processor.run_tail(file_paths=file_paths)
+        
+    except typer.BadParameter:
+        raise
+    except Exception as e:
+        console.print(f"[bold red]错误:[/bold red] {str(e)}")
+        raise typer.Exit(code=1)
+
+
+@stream_app.command("replay")
+def stream_replay(
+    config: Path = typer.Option(
+        ...,
+        "--config",
+        "-c",
+        help="Pipeline配置文件路径(YAML格式)",
+        exists=True,
+        readable=True,
+    ),
+    input_file: Path = typer.Option(
+        ...,
+        "--input",
+        "-i",
+        help="已脱敏的日志文件路径(JSONL格式)",
+        exists=True,
+        readable=True,
+    ),
+    speed: float = typer.Option(
+        1.0,
+        "--speed",
+        help="回放速度倍率，默认1.0为实时速度",
+    ),
+    high_watermark: Optional[int] = typer.Option(
+        None,
+        "--high-watermark",
+        help="背压高水位(默认10000)",
+    ),
+    low_watermark: Optional[int] = typer.Option(
+        None,
+        "--low-watermark",
+        help="背压低水位(默认5000)",
+    ),
+    drain_timeout: Optional[int] = typer.Option(
+        None,
+        "--drain-timeout",
+        help="优雅退出等待超时秒数(默认30)",
+    ),
+):
+    """
+    回放已脱敏的日志文件，按时间戳间隔模拟实时输入，用于调试异常检测引擎
+    示例: log-sanitizer stream replay --input sanitized.jsonl --config config.yaml --speed 2.0
+    """
+    try:
+        import json as _json
+        from datetime import datetime as _datetime
+        
+        pipeline_config = ConfigLoader.load(str(config))
+        
+        _apply_stream_options(
+            pipeline_config,
+            high_watermark,
+            low_watermark,
+            drain_timeout,
+            None,
+            None,
+        )
+        
+        pipeline_config.stream.enabled = True
+        
+        console.print(Panel.fit(
+            f"[bold]日志回放模式[/bold]\n"
+            f"输入文件: {input_file}\n"
+            f"回放速度: {speed}x",
+            border_style="blue",
+        ))
+        
+        alerts_triggered: List[Dict[str, Any]] = []
+        
+        def _alert_capture(alert: Any) -> None:
+            alerts_triggered.append({
+                "timestamp": alert.timestamp.isoformat() if hasattr(alert, 'timestamp') else str(getattr(alert, 'timestamp', '')),
+                "severity": getattr(alert, 'severity', 'UNKNOWN').value if hasattr(getattr(alert, 'severity', None), 'value') else str(getattr(alert, 'severity', 'UNKNOWN')),
+                "alert_type": getattr(alert, 'alert_type', 'UNKNOWN').value if hasattr(getattr(alert, 'alert_type', None), 'value') else str(getattr(alert, 'alert_type', 'UNKNOWN')),
+                "source": getattr(alert, 'source', ''),
+                "detector": getattr(alert, 'detector', 'UNKNOWN').value if hasattr(getattr(alert, 'detector', None), 'value') else str(getattr(alert, 'detector', 'UNKNOWN')),
+                "trigger_value": getattr(alert, 'trigger_value', 0),
+                "threshold": getattr(alert, 'threshold', 0),
+                "description": getattr(alert, 'description', ''),
+            })
+        
+        processor = StreamProcessor(pipeline_config, output_target="stdout")
+        
+        if processor.anomaly_engine and processor.anomaly_engine.alert_output:
+            original_write = processor.anomaly_engine.alert_output.write_alert
+            processor.anomaly_engine.alert_output.write_alert = _alert_capture
+        
+        entries = []
+        with open(input_file, 'r', encoding='utf-8') as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = _json.loads(line)
+                    entries.append((line_num, data))
+                except _json.JSONDecodeError as e:
+                    console.print(f"[yellow]警告: 第 {line_num} 行JSON解析失败: {e}[/yellow]")
+        
+        if not entries:
+            console.print("[yellow]没有可回放的日志条目[/yellow]")
+            return
+        
+        console.print(f"[cyan]共加载 {len(entries)} 条日志，开始回放...[/cyan]\n")
+        
+        last_timestamp = None
+        start_real_time = time.monotonic()
+        start_log_time = None
+        
+        for idx, (line_num, data) in enumerate(entries):
+            if processor._stop_event.is_set() or processor._graceful_shutdown.is_set():
+                break
+            
+            ts_str = data.get('timestamp')
+            current_timestamp = None
+            if ts_str:
+                try:
+                    current_timestamp = _datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+                except (ValueError, AttributeError):
+                    pass
+            
+            if current_timestamp and last_timestamp:
+                delay_seconds = (current_timestamp - last_timestamp).total_seconds() / speed
+                if delay_seconds > 0:
+                    if processor._stop_event.wait(timeout=delay_seconds):
+                        break
+            
+            if last_timestamp is None and current_timestamp:
+                start_log_time = current_timestamp
+            
+            last_timestamp = current_timestamp
+            
+            entry = LogEntry(
+                raw=_json.dumps(data, ensure_ascii=False),
+                source=data.get('source', 'replay'),
+                format=LogFormat.JSON,
+                timestamp=current_timestamp,
+                level=LogLevel(data.get('level', 'UNKNOWN').upper()) if data.get('level') else LogLevel.UNKNOWN,
+                message=data.get('message', ''),
+                extra=data.get('extra', {}),
+                is_parseable=True,
+            )
+            
+            with processor._status_lock:
+                processor.status.processed_lines += 1
+                processor.status.source_processed_lines[entry.source] = \
+                    processor.status.source_processed_lines.get(entry.source, 0) + 1
+            
+            if processor.anomaly_engine and entry.is_parseable:
+                with processor._status_lock:
+                    current_line = processor.status.processed_lines
+                processor.anomaly_engine.process_entry(entry, current_line, current_line)
+            
+            if processor._stream_config.heartbeat_interval > 0 and (idx + 1) % 1000 == 0:
+                elapsed = time.monotonic() - start_real_time
+                console.print(f"[dim]已回放 {idx + 1}/{len(entries)} 条, 耗时 {elapsed:.1f}s[/dim]", end='\r')
+        
+        console.print()
+        
+        if processor.anomaly_engine:
+            processor.anomaly_engine.stop()
+        
+        console.print(f"\n[bold green]回放完成![/bold green]")
+        
+        if alerts_triggered:
+            type_distribution: Dict[str, int] = {}
+            severity_distribution: Dict[str, int] = {}
+            source_distribution: Dict[str, int] = {}
+            
+            for alert in alerts_triggered:
+                atype = alert.get('alert_type', 'UNKNOWN')
+                severity = alert.get('severity', 'UNKNOWN')
+                source = alert.get('source', 'UNKNOWN')
+                type_distribution[atype] = type_distribution.get(atype, 0) + 1
+                severity_distribution[severity] = severity_distribution.get(severity, 0) + 1
+                source_distribution[source] = source_distribution.get(source, 0) + 1
+            
+            console.print(Panel.fit(
+                f"[bold]检测引擎统计摘要[/bold]\n"
+                f"总告警数: {len(alerts_triggered)}",
+                border_style="magenta",
+            ))
+            
+            table = Table(title="告警类型分布", show_header=True, header_style="bold blue")
+            table.add_column("类型", style="cyan")
+            table.add_column("数量", style="magenta", justify="right")
+            for atype, count in sorted(type_distribution.items(), key=lambda x: -x[1]):
+                table.add_row(atype, str(count))
+            console.print(table)
+            
+            table = Table(title="告警级别分布", show_header=True, header_style="bold blue")
+            table.add_column("级别", style="cyan")
+            table.add_column("数量", style="yellow", justify="right")
+            for severity, count in sorted(severity_distribution.items(), key=lambda x: -x[1]):
+                table.add_row(severity, str(count))
+            console.print(table)
+            
+            table = Table(title="告警Source分布", show_header=True, header_style="bold blue")
+            table.add_column("Source", style="cyan")
+            table.add_column("数量", style="green", justify="right")
+            for source, count in sorted(source_distribution.items(), key=lambda x: -x[1]):
+                table.add_row(source, str(count))
+            console.print(table)
+        else:
+            console.print("[yellow]回放过程中未触发任何告警[/yellow]")
         
     except typer.BadParameter:
         raise
