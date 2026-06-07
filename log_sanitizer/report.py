@@ -1,11 +1,116 @@
 import json
 import os
-from typing import Dict, Any
+from typing import Dict, Any, List, Tuple
 from datetime import datetime, timezone
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
 from .models import AuditReport, FileStats, SensitiveType
 
 
 class ReportGenerator:
+    @staticmethod
+    def generate_console_summary(report: AuditReport) -> Panel:
+        console = Console()
+        
+        duration = report.processing_time
+        throughput = report.throughput
+        
+        main_table = Table.grid(padding=(0, 2))
+        main_table.add_column(style="cyan")
+        main_table.add_column()
+        
+        main_table.add_row(
+            "[bold]处理时长:",
+            f"[green]{duration:.2f}[/green] 秒"
+        )
+        main_table.add_row(
+            "[bold]吞吐量:",
+            f"[green]{throughput:.0f}[/green] 行/秒"
+        )
+        main_table.add_row(
+            "[bold]总行数:",
+            f"[white]{report.total_lines:,}[/white]"
+        )
+        main_table.add_row(
+            "[bold]解析成功:",
+            f"[green]{report.parsed_lines:,}[/green]"
+        )
+        main_table.add_row(
+            "[bold]解析失败:",
+            f"[red]{report.unparsed_lines:,}[/red] ([yellow]{report.parse_failure_rate:.2%}[/yellow])"
+        )
+        main_table.add_row(
+            "[bold]脱敏字段:",
+            f"[magenta]{report.sanitized_fields:,}[/magenta] / {report.total_fields:,} ([cyan]{report.sanitize_coverage:.2%}[/cyan])"
+        )
+        
+        detection_items = list(report.detections.items())
+        if detection_items:
+            max_count = max(count for _, count in detection_items)
+            max_bar_width = 30
+            
+            detection_table = Table(
+                show_header=True,
+                header_style="bold magenta",
+                border_style="dim",
+                box=None,
+            )
+            detection_table.add_column("类型", style="cyan", no_wrap=True)
+            detection_table.add_column("计数", justify="right", style="green")
+            detection_table.add_column("分布", justify="left")
+            
+            for stype, count in sorted(detection_items, key=lambda x: -x[1]):
+                bar_width = int(count / max_count * max_bar_width) if max_count > 0 else 0
+                bar = "█" * bar_width
+                color = "green"
+                if stype.value in ["ipv4", "ipv6"]:
+                    color = "blue"
+                elif stype.value in ["email", "phone"]:
+                    color = "yellow"
+                elif stype.value in ["id_card", "bank_card"]:
+                    color = "red"
+                detection_table.add_row(
+                    stype.value.upper(),
+                    f"{count:,}",
+                    f"[{color}]{bar}[/{color}] [dim]({count/max_count*100:.0f}%)[/dim]"
+                )
+            
+            main_table.add_row("", "")
+            main_table.add_row("[bold]敏感信息分布:", "")
+            main_table.add_row(Panel(detection_table, border_style="magenta"), "")
+        
+        if report.field_path_counts:
+            top_fields = sorted(
+                report.field_path_counts.items(),
+                key=lambda x: -x[1]
+            )[:5]
+            
+            top_table = Table(
+                show_header=True,
+                header_style="bold cyan",
+                border_style="dim",
+                box=None,
+            )
+            top_table.add_column("排名", justify="right", style="yellow")
+            top_table.add_column("字段路径", style="white")
+            top_table.add_column("脱敏次数", justify="right", style="magenta")
+            
+            for i, (field_path, count) in enumerate(top_fields, 1):
+                top_table.add_row(str(i), field_path, f"{count:,}")
+            
+            main_table.add_row("", "")
+            main_table.add_row("[bold]Top 5 脱敏字段:", "")
+            main_table.add_row(Panel(top_table, border_style="cyan"), "")
+        
+        return Panel(
+            main_table,
+            title="[bold green]✓ 处理完成[/bold green]",
+            border_style="green",
+            padding=(1, 2),
+        )
+    
     @staticmethod
     def generate_json(report: AuditReport) -> str:
         data = ReportGenerator._report_to_dict(report)
@@ -144,6 +249,9 @@ class ReportAccumulator:
         
         for stype, count in stats.detections.items():
             self.report.detections[stype] = self.report.detections.get(stype, 0) + count
+        
+        for field_path, count in stats.field_path_counts.items():
+            self.report.field_path_counts[field_path] = self.report.field_path_counts.get(field_path, 0) + count
         
         self.report.file_stats[file_path] = stats
 

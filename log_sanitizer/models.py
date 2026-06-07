@@ -102,6 +102,34 @@ class FileStats:
     sanitized_fields: int = 0
     total_fields: int = 0
     detections: Dict[SensitiveType, int] = field(default_factory=dict)
+    field_path_counts: Dict[str, int] = field(default_factory=dict)
+    bytes_processed: int = 0
+
+
+@dataclass
+class AuditLogEntry:
+    line_number: int
+    field_path: str
+    original_value: str
+    sanitized_value: str
+    rule_name: str
+    timestamp: Optional[datetime] = None
+
+
+@dataclass
+class FileState:
+    file_path: str
+    inode: int
+    last_offset: int
+    last_processed_time: Optional[datetime] = None
+    file_size: int = 0
+
+
+@dataclass
+class StateFile:
+    version: str = "1.0"
+    files: Dict[str, FileState] = field(default_factory=dict)
+    last_updated: Optional[datetime] = None
 
 
 @dataclass
@@ -119,3 +147,4 @@ class AuditReport:
     throughput: float = 0.0
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
+    field_path_counts: Dict[str, int] = field(default_factory=dict)

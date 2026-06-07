@@ -26,6 +26,13 @@ class SanitizationEngine:
         self.mapping_manager = mapping_manager or MappingManager(in_memory=True)
         self._rule_cache: Dict[str, SanitizeRule] = {rule.name: rule for rule in self.detector.rules}
     
+    def update_detector(self, detector: SensitiveDataDetector) -> None:
+        self.detector = detector
+        self._rule_cache = {rule.name: rule for rule in self.detector.rules}
+    
+    def _rebuild_rule_cache(self) -> None:
+        self._rule_cache = {rule.name: rule for rule in self.detector.rules}
+    
     @staticmethod
     def _parse_field_path(path: str) -> List[str]:
         parts: List[str] = []
@@ -55,13 +62,15 @@ class SanitizationEngine:
             parts.append(current)
         return parts
 
-    def sanitize_entry(self, entry: LogEntry) -> Tuple[LogEntry, Dict[SensitiveType, int], int, int]:
+    def sanitize_entry(self, entry: LogEntry) -> Tuple[LogEntry, Dict[SensitiveType, int], int, int, List[Tuple[str, str, str, str]], Dict[str, int]]:
         if not entry.is_parseable:
-            return entry, {}, 0, 0
+            return entry, {}, 0, 0, [], {}
         
         detections: Dict[SensitiveType, int] = {}
         sanitized_fields_count = 0
         total_fields_count = 0
+        audit_entries: List[Tuple[str, str, str, str]] = []
+        field_path_counts: Dict[str, int] = {}
         
         fields_to_process = [
             ("message", entry.message),
@@ -91,14 +100,20 @@ class SanitizationEngine:
                     detections[match.type] = detections.get(match.type, 0) + 1
         
         if not field_detections:
-            return entry, detections, sanitized_fields_count, total_fields_count
+            return entry, detections, sanitized_fields_count, total_fields_count, audit_entries, field_path_counts
         
         if "message" in field_detections:
+            original_message = entry.message
+            matches = field_detections["message"]
             entry.message = self._sanitize_value(
-                entry.message,
-                field_detections["message"],
+                original_message,
+                matches,
             )
-            sanitized_fields_count += 1
+            if original_message != entry.message:
+                sanitized_fields_count += 1
+                rule_name = matches[0].rule_name if matches else "unknown"
+                audit_entries.append(("message", original_message, entry.message, rule_name))
+                field_path_counts["message"] = field_path_counts.get("message", 0) + len(matches)
         
         def update_nested_field(data: Any, path_parts: List[str], value: str) -> Any:
             if not path_parts:
@@ -142,10 +157,13 @@ class SanitizationEngine:
                     else:
                         new_value = self._sanitize_value(current_value, matches)
                     
-                    entry.extra = update_nested_field(entry.extra, path_parts, new_value)
-                    sanitized_fields_count += 1
+                    if current_value != new_value:
+                        entry.extra = update_nested_field(entry.extra, path_parts, new_value)
+                        sanitized_fields_count += 1
+                        audit_entries.append((field_path, current_value, new_value, rule_name or "unknown"))
+                        field_path_counts[field_path] = field_path_counts.get(field_path, 0) + len(matches)
         
-        return entry, detections, sanitized_fields_count, total_fields_count
+        return entry, detections, sanitized_fields_count, total_fields_count, audit_entries, field_path_counts
 
     def _sanitize_value(
         self,

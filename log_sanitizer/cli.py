@@ -89,6 +89,11 @@ def run_pipeline(
         "--no-progress",
         help="不显示进度条",
     ),
+    incremental: bool = typer.Option(
+        False,
+        "--incremental",
+        help="启用增量处理模式，从上次处理的断点继续",
+    ),
 ):
     """
     执行日志处理Pipeline
@@ -112,6 +117,9 @@ def run_pipeline(
             pipeline_config.output.file = str(output)
             pipeline_config.output.stdout = False
         
+        if incremental:
+            pipeline_config.incremental = True
+        
         processor = LogProcessor(pipeline_config)
         files = processor.discover_files()
         
@@ -119,15 +127,21 @@ def run_pipeline(
             console.print("[yellow]警告: 没有找到匹配的输入文件[/yellow]")
             return
         
+        info_lines = [f"[bold]发现 {len(files)} 个文件待处理[/bold]"]
+        if pipeline_config.incremental:
+            info_lines.append("[cyan]增量处理模式已启用[/cyan]")
+        if pipeline_config.audit_log.enabled:
+            info_lines.append("[magenta]审计日志已启用[/magenta]")
+        
         console.print(Panel.fit(
-            f"[bold]发现 {len(files)} 个文件待处理[/bold]",
+            "\n".join(info_lines),
             border_style="blue",
         ))
         
         report = processor.run(show_progress=not no_progress)
         
-        console.print("\n[bold green]处理完成![/bold green]")
-        console.print(ReportGenerator.generate_text(report))
+        console.print()
+        console.print(ReportGenerator.generate_console_summary(report))
         
         if pipeline_config.report_file:
             console.print(f"\n[dim]文本报告已保存到: {pipeline_config.report_file}[/dim]")
@@ -261,9 +275,15 @@ sanitizers:
 
 # 输出配置
 output:
+  # 输出目标: file 或 stdout
+  target: "file"
   file: "./output/sanitized_logs.jsonl"
   stdout: false
-  split_by_day: false  # 按天分割输出文件
+  # 按时间分割: day 或 hour
+  # split_by_time: "day"
+  # 文件名模板, 支持 {date} 和 {hour} 占位符
+  # filename_template: "output_{date}_{hour}.jsonl"
+  split_by_day: false  # 按天分割输出文件(已废弃, 使用 split_by_time)
   overwrite: false
   encoding: "utf-8"
   pretty: false  # 格式化JSON输出
@@ -271,6 +291,14 @@ output:
 # 处理配置
 parallelism: 4  # 并行处理的文件数，默认CPU核心数
 dry_run: false  # 只预览不实际写入
+incremental: false  # 增量处理模式
+# 增量处理状态文件路径(JSON格式)
+# state_file: "./output/.processing_state.json"
+
+# 脱敏前后对照审计日志
+audit_log:
+  enabled: false
+  file: "./output/audit_log.jsonl"
 
 # 审计报告配置
 report_file: "./output/audit_report.txt"
@@ -313,8 +341,22 @@ def validate_config(
         
         if pipeline_config.output.file:
             table.add_row("输出文件", pipeline_config.output.file)
-        if pipeline_config.output.stdout:
+        if pipeline_config.output.stdout or pipeline_config.output.target == "stdout":
             table.add_row("输出到标准输出", "是")
+        if pipeline_config.output.split_by_time:
+            table.add_row("按时间分割", pipeline_config.output.split_by_time)
+        if pipeline_config.output.filename_template != "output_{date}.jsonl":
+            table.add_row("文件名模板", pipeline_config.output.filename_template)
+        
+        if pipeline_config.incremental:
+            table.add_row("增量模式", "已启用")
+            if pipeline_config.state_file:
+                table.add_row("状态文件", pipeline_config.state_file)
+        
+        if pipeline_config.audit_log.enabled:
+            table.add_row("审计日志", "已启用")
+            if pipeline_config.audit_log.file:
+                table.add_row("审计日志文件", pipeline_config.audit_log.file)
         
         table.add_row(
             "内置脱敏规则",

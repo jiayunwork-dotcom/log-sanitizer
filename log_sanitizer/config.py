@@ -85,10 +85,19 @@ class SanitizersConfig:
 class OutputConfig:
     file: Optional[str] = None
     stdout: bool = False
+    target: str = "file"
     split_by_day: bool = False
+    split_by_time: Optional[str] = None
+    filename_template: str = "output_{date}.jsonl"
     overwrite: bool = False
     encoding: str = "utf-8"
     pretty: bool = False
+
+
+@dataclass
+class AuditLogConfig:
+    enabled: bool = False
+    file: Optional[str] = None
 
 
 @dataclass
@@ -103,6 +112,10 @@ class PipelineConfig:
     dry_run: bool = False
     report_file: Optional[str] = None
     report_json: Optional[str] = None
+    state_file: Optional[str] = None
+    incremental: bool = False
+    audit_log: AuditLogConfig = field(default_factory=AuditLogConfig)
+    config_path: Optional[str] = None
 
 
 class ConfigLoader:
@@ -114,7 +127,66 @@ class ConfigLoader:
         with open(config_path, 'r', encoding='utf-8') as f:
             config_data = yaml.safe_load(f)
         
-        return ConfigLoader._parse_config(config_data)
+        pipeline = ConfigLoader._parse_config(config_data)
+        pipeline.config_path = os.path.abspath(config_path)
+        return pipeline
+    
+    @staticmethod
+    def load_sanitizers_only(config_path: str) -> SanitizersConfig:
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"Config file not found: {config_path}")
+        
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config_data = yaml.safe_load(f)
+        
+        sanitizers_data = config_data.get('sanitizers', {})
+        if not sanitizers_data:
+            raise ValueError("No sanitizers configuration found")
+        
+        return ConfigLoader._parse_sanitizers_config(sanitizers_data)
+    
+    @staticmethod
+    def _parse_sanitizers_config(sanitizers_data: Dict[str, Any]) -> SanitizersConfig:
+        builtin_rules = {}
+        strategies: Dict[str, SanitizeStrategy] = {}
+        params: Dict[str, Dict[str, Any]] = {}
+        
+        if 'builtin_rules' in sanitizers_data:
+            for rule in sanitizers_data['builtin_rules']:
+                if isinstance(rule, dict):
+                    name = rule.get('name', '')
+                    enabled = rule.get('enabled', True)
+                    builtin_rules[name] = enabled
+                    if 'strategy' in rule:
+                        strategies[name] = SanitizeStrategy(rule['strategy'].lower())
+                    if 'params' in rule:
+                        params[name] = rule['params']
+                elif isinstance(rule, str):
+                    builtin_rules[rule] = True
+        
+        custom_rules = []
+        if 'custom_rules' in sanitizers_data:
+            for rule_data in sanitizers_data['custom_rules']:
+                rule = SanitizerRuleConfig(
+                    name=rule_data.get('name', f"custom_{len(custom_rules)}"),
+                    enabled=rule_data.get('enabled', True),
+                    strategy=rule_data.get('strategy'),
+                    params=rule_data.get('params', {}),
+                    pattern=rule_data.get('pattern'),
+                    type=rule_data.get('type', 'custom'),
+                )
+                ConfigLoader._validate_custom_rule(rule)
+                custom_rules.append(rule)
+        
+        return SanitizersConfig(
+            builtin_rules=builtin_rules,
+            custom_rules=custom_rules,
+            strategies=strategies,
+            params=params,
+            mapping_db_path=sanitizers_data.get('mapping_db_path'),
+            hmac_key=sanitizers_data.get('hmac_key'),
+            mapping_in_memory=sanitizers_data.get('mapping_in_memory', False),
+        )
 
     @staticmethod
     def load_from_string(config_str: str) -> PipelineConfig:
@@ -126,12 +198,21 @@ class ConfigLoader:
         if not isinstance(config_data, dict):
             raise ValueError("Invalid config format: expected a dictionary")
         
+        audit_log_data = config_data.get('audit_log', {})
+        audit_log_config = AuditLogConfig(
+            enabled=audit_log_data.get('enabled', False),
+            file=audit_log_data.get('file'),
+        )
+        
         pipeline = PipelineConfig(
             name=config_data.get('name', 'default'),
             parallelism=config_data.get('parallelism', os.cpu_count() or 1),
             dry_run=config_data.get('dry_run', False),
             report_file=config_data.get('report_file'),
             report_json=config_data.get('report_json'),
+            state_file=config_data.get('state_file'),
+            incremental=config_data.get('incremental', False),
+            audit_log=audit_log_config,
         )
         
         inputs_data = config_data.get('inputs', {})
@@ -208,10 +289,18 @@ class ConfigLoader:
         
         output_data = config_data.get('output', {})
         if output_data:
+            target = output_data.get('target', 'file')
+            stdout = output_data.get('stdout', False)
+            if target == 'stdout':
+                stdout = True
+            
             pipeline.output = OutputConfig(
                 file=output_data.get('file'),
-                stdout=output_data.get('stdout', False),
+                stdout=stdout,
+                target=target,
                 split_by_day=output_data.get('split_by_day', False),
+                split_by_time=output_data.get('split_by_time'),
+                filename_template=output_data.get('filename_template', 'output_{date}.jsonl'),
                 overwrite=output_data.get('overwrite', False),
                 encoding=output_data.get('encoding', 'utf-8'),
                 pretty=output_data.get('pretty', False),

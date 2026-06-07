@@ -8,13 +8,15 @@ from typing import List, Optional, Dict, Any, Generator, Tuple
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 from datetime import datetime
-from .models import LogEntry, FileStats, AuditReport, LogLevel, SensitiveType
-from .config import PipelineConfig
+from .models import LogEntry, FileStats, AuditReport, LogLevel, SensitiveType, AuditLogEntry
+from .config import PipelineConfig, SanitizersConfig, ConfigLoader
 from .parser import LogParser
 from .detector import SensitiveDataDetector
 from .sanitizer import SanitizationEngine
 from .mapping_manager import MappingManager
 from .report import ReportAccumulator, ReportGenerator
+from .state_manager import StateManager
+from .audit_logger import AuditLogger
 
 
 class LogProcessor:
@@ -24,6 +26,26 @@ class LogProcessor:
         self.mapping_manager = self._create_mapping_manager()
         self.sanitizer = SanitizationEngine(self.detector, self.mapping_manager)
         self._output_handles: Dict[str, io.TextIOWrapper] = {}
+        self.state_manager: Optional[StateManager] = None
+        self.audit_logger: Optional[AuditLogger] = None
+        self._config_mtime: Optional[float] = None
+        self._hot_reload_enabled = False
+        
+        if self.config.incremental and self.config.state_file:
+            self.state_manager = StateManager(self.config.state_file)
+        
+        if self.config.audit_log.enabled and self.config.audit_log.file:
+            self.audit_logger = AuditLogger(
+                self.config.audit_log.file,
+                self.config.audit_log.enabled,
+            )
+        
+        if self.config.config_path and os.path.exists(self.config.config_path):
+            try:
+                self._config_mtime = os.path.getmtime(self.config.config_path)
+                self._hot_reload_enabled = True
+            except OSError:
+                self._hot_reload_enabled = False
 
     def _create_detector(self) -> SensitiveDataDetector:
         sanitizers = self.config.sanitizers
@@ -109,7 +131,54 @@ class LogProcessor:
         
         return True
 
-    def process_file(self, file_path: str, show_progress: bool = True) -> Tuple[FileStats, List[Tuple[str, str]]]:
+    def _check_config_hot_reload(self) -> bool:
+        if not self._hot_reload_enabled or not self.config.config_path:
+            return False
+        
+        try:
+            current_mtime = os.path.getmtime(self.config.config_path)
+            if current_mtime != self._config_mtime:
+                self._reload_sanitizers()
+                self._config_mtime = current_mtime
+                return True
+        except OSError:
+            pass
+        return False
+    
+    def _reload_sanitizers(self) -> None:
+        if not self.config.config_path:
+            return
+        
+        try:
+            new_sanitizers_config = ConfigLoader.load_sanitizers_only(self.config.config_path)
+            
+            custom_rules_data = []
+            for rule in new_sanitizers_config.custom_rules:
+                rule_dict: Dict[str, Any] = {
+                    "name": rule.name,
+                    "pattern": rule.pattern or "",
+                    "type": rule.type.value if rule.type else "custom",
+                    "strategy": rule.strategy.value if rule.strategy else "mask",
+                    "params": rule.params,
+                }
+                custom_rules_data.append(rule_dict)
+            
+            self.detector.reload_rules(
+                builtin_rules=new_sanitizers_config.builtin_rules,
+                custom_rules=custom_rules_data,
+                override_strategies=new_sanitizers_config.strategies,
+                override_params=new_sanitizers_config.params,
+            )
+            
+            self.sanitizer._rebuild_rule_cache()
+            
+            self.config.sanitizers = new_sanitizers_config
+            
+            print(f"[INFO] Sanitization rules reloaded successfully from {self.config.config_path}", file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"[WARNING] Failed to reload sanitization rules, keeping old rules: {e}", file=sys.stderr, flush=True)
+    
+    def process_file(self, file_path: str, show_progress: bool = True, progress_callback=None) -> Tuple[FileStats, List[Tuple[str, str]]]:
         stats = FileStats(file_path=file_path)
         parser = LogParser(
             format=self.config.parser.format,
@@ -119,10 +188,17 @@ class LogProcessor:
         )
         
         preview_records: List[Tuple[str, str]] = []
+        
+        start_offset = 0
+        if self.state_manager:
+            start_offset = self.state_manager.should_start_from_breakpoint(file_path)
+        
+        current_offset = start_offset
         total_lines = self.count_lines(file_path, self.config.inputs.encoding)
         
         pbar = tqdm(
             total=total_lines,
+            initial=0,
             desc=f"Processing {os.path.basename(file_path)}",
             unit="lines",
             disable=not show_progress,
@@ -131,9 +207,25 @@ class LogProcessor:
         
         try:
             with open(file_path, 'r', encoding=self.config.inputs.encoding, errors='replace') as f:
+                if start_offset > 0:
+                    f.seek(start_offset)
+                
+                lines_processed = 0
                 for line in f:
+                    line_bytes = len(line.encode(self.config.inputs.encoding))
+                    current_offset += line_bytes
                     stats.total_lines += 1
+                    stats.bytes_processed += line_bytes
+                    lines_processed += 1
                     pbar.update(1)
+                    
+                    if lines_processed % 1000 == 0:
+                        self._check_config_hot_reload()
+                        if self.state_manager:
+                            self.state_manager.update_file_state(file_path, current_offset)
+                            self.state_manager.save()
+                        if progress_callback:
+                            progress_callback(stats.detections)
                     
                     entry = parser.parse_line(line)
                     
@@ -149,13 +241,27 @@ class LogProcessor:
                         continue
                     
                     original_message = entry.message
-                    entry, detections, sanitized, total_fields = self.sanitizer.sanitize_entry(entry)
+                    entry, detections, sanitized, total_fields, audit_entries, field_path_counts = self.sanitizer.sanitize_entry(entry)
                     
                     stats.sanitized_fields += sanitized
                     stats.total_fields += total_fields
                     
                     for stype, count in detections.items():
                         stats.detections[stype] = stats.detections.get(stype, 0) + count
+                    
+                    for field_path, count in field_path_counts.items():
+                        stats.field_path_counts[field_path] = stats.field_path_counts.get(field_path, 0) + count
+                    
+                    if self.audit_logger and audit_entries:
+                        for field_path, orig_val, sanitized_val, rule_name in audit_entries:
+                            self.audit_logger.log(
+                                line_number=stats.total_lines,
+                                field_path=field_path,
+                                original_value=orig_val,
+                                sanitized_value=sanitized_val,
+                                rule_name=rule_name,
+                                timestamp=entry.timestamp,
+                            )
                     
                     if self.config.dry_run and len(preview_records) < 20:
                         preview_records.append((original_message, entry.message))
@@ -165,26 +271,57 @@ class LogProcessor:
         
         finally:
             pbar.close()
+            if self.state_manager:
+                self.state_manager.update_file_state(file_path, current_offset)
+                self.state_manager.save()
         
         return stats, preview_records
 
+    def _get_output_path(self, entry: LogEntry) -> Optional[str]:
+        output = self.config.output
+        
+        if not output.file:
+            return None
+        
+        output_path = output.file
+        
+        split_by = output.split_by_time
+        if not split_by and output.split_by_day:
+            split_by = 'day'
+        
+        if split_by and entry.timestamp:
+            date_str = entry.timestamp.strftime('%Y-%m-%d')
+            hour_str = entry.timestamp.strftime('%H')
+            
+            template = output.filename_template
+            if '{date}' in template or '{hour}' in template:
+                output_path = template.format(date=date_str, hour=hour_str)
+            else:
+                base, ext = os.path.splitext(output.file)
+                if split_by == 'hour':
+                    output_path = f"{base}_{date_str}_{hour_str}{ext}"
+                else:
+                    output_path = f"{base}_{date_str}{ext}"
+            
+            if not os.path.isabs(output_path) and output.file:
+                base_dir = os.path.dirname(output.file)
+                if base_dir:
+                    output_path = os.path.join(base_dir, os.path.basename(output_path))
+        
+        return output_path
+    
     def _write_output(self, entry: LogEntry, source_file: str) -> None:
         output = self.config.output
         
-        if output.stdout:
+        if output.stdout or output.target == 'stdout':
             json_str = json.dumps(entry.to_standard_dict(), ensure_ascii=False)
             if output.pretty:
                 json_str = json.dumps(entry.to_standard_dict(), ensure_ascii=False, indent=2)
             print(json_str)
             return
         
-        if output.file:
-            output_path = output.file
-            if output.split_by_day and entry.timestamp:
-                day_str = entry.timestamp.strftime('%Y-%m-%d')
-                base, ext = os.path.splitext(output.file)
-                output_path = f"{base}_{day_str}{ext}"
-            
+        output_path = self._get_output_path(entry)
+        if output_path:
             handle = self._get_output_handle(output_path)
             json_str = json.dumps(entry.to_standard_dict(), ensure_ascii=False)
             if output.pretty:
@@ -211,6 +348,10 @@ class LogProcessor:
                 pass
         self._output_handles.clear()
         self.mapping_manager.close()
+        if self.state_manager:
+            self.state_manager.close()
+        if self.audit_logger:
+            self.audit_logger.close()
 
     def run(self, show_progress: bool = True) -> AuditReport:
         files = self.discover_files()
@@ -351,7 +492,10 @@ class LogProcessor:
             "output": {
                 "file": self.config.output.file,
                 "stdout": self.config.output.stdout,
+                "target": self.config.output.target,
                 "split_by_day": self.config.output.split_by_day,
+                "split_by_time": self.config.output.split_by_time,
+                "filename_template": self.config.output.filename_template,
                 "overwrite": self.config.output.overwrite,
                 "encoding": self.config.output.encoding,
                 "pretty": self.config.output.pretty,
@@ -360,6 +504,12 @@ class LogProcessor:
             "dry_run": self.config.dry_run,
             "report_file": self.config.report_file,
             "report_json": self.config.report_json,
+            "state_file": self.config.state_file,
+            "incremental": self.config.incremental,
+            "audit_log": {
+                "enabled": self.config.audit_log.enabled,
+                "file": self.config.audit_log.file,
+            },
         }
 
     def _print_dry_run_preview(self, preview: List[Tuple[str, str, str]]) -> None:

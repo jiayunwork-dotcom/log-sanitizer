@@ -100,7 +100,35 @@ class SensitiveDataDetector:
         override_params: Optional[Dict[str, Dict[str, Any]]] = None,
     ):
         self.rules: List[SanitizeRule] = []
+        self._builtin_rules_config = builtin_rules
+        self._custom_rules_config = custom_rules
+        self._override_strategies = override_strategies
+        self._override_params = override_params
         self._compile_rules(builtin_rules, custom_rules, override_strategies, override_params)
+
+    def reload_rules(
+        self,
+        builtin_rules: Optional[Dict[str, bool]] = None,
+        custom_rules: Optional[List[Dict[str, Any]]] = None,
+        override_strategies: Optional[Dict[str, SanitizeStrategy]] = None,
+        override_params: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> None:
+        if builtin_rules is not None:
+            self._builtin_rules_config = builtin_rules
+        if custom_rules is not None:
+            self._custom_rules_config = custom_rules
+        if override_strategies is not None:
+            self._override_strategies = override_strategies
+        if override_params is not None:
+            self._override_params = override_params
+        
+        self.rules.clear()
+        self._compile_rules(
+            self._builtin_rules_config,
+            self._custom_rules_config,
+            self._override_strategies,
+            self._override_params,
+        )
 
     def _compile_rules(
         self,
