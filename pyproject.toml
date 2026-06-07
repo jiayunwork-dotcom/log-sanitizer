@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "log-sanitizer"
+version = "1.0.0"
+description = "批量日志文件脱敏与格式标准化命令行工具"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+    { name = "Log Sanitizer Team" }
+]
+keywords = ["log", "sanitizer", "privacy", "security", "json"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+    "Topic :: System :: Logging",
+    "Topic :: Text Processing",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "typer>=0.9.0",
+    "pyyaml>=6.0",
+    "rich>=13.0.0",
+    "tqdm>=4.65.0",
+    "jsonschema>=4.17.0",
+]
+
+[project.scripts]
+log-sanitizer = "log_sanitizer.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["log_sanitizer*"]

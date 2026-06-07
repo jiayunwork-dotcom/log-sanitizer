@@ -1,0 +1,114 @@
+# log-sanitizer Pipeline 配置文件示例
+name: "log-processing-pipeline"
+
+# 输入源配置
+inputs:
+  paths:
+    - "./logs/*.log"
+    - "./data/access_log"
+  recursive: true
+  encoding: "utf-8"
+
+# 解析器配置
+parser:
+  # 日志格式: auto, json, apache, nginx, syslog, plaintext, custom
+  format: "auto"
+  # 自定义格式时使用，正则表达式中使用命名捕获组
+  # custom_pattern: '^(?P<timestamp>\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}) \\[(?P<level>[A-Z]+)\\] (?P<message>.*)$'
+  # custom_field_names:
+  #   timestamp: "timestamp"
+  #   level: "level"
+  #   message: "message"
+
+# 过滤条件(可选)
+filters:
+  # 只处理指定级别
+  # levels: ["INFO", "WARN", "ERROR"]
+  # 时间范围过滤
+  # start_time: "2024-01-01T00:00:00+00:00"
+  # end_time: "2024-12-31T23:59:59+00:00"
+  # 包含关键词
+  # include_keywords: ["error", "warning"]
+  # 排除关键词
+  # exclude_keywords: ["healthcheck", "debug"]
+
+# 脱敏规则配置
+sanitizers:
+  # 内置规则开关
+  builtin_rules:
+    - name: "ipv4"
+      enabled: true
+      strategy: "generalize"  # mask, hash, replace, delete, generalize
+    - name: "ipv6"
+      enabled: true
+      strategy: "generalize"
+    - name: "email"
+      enabled: true
+      strategy: "generalize"
+    - name: "phone"
+      enabled: true
+      strategy: "mask"
+      params:
+        keep_start: 3
+        keep_end: 4
+    - name: "id_card"
+      enabled: true
+      strategy: "mask"
+      params:
+        keep_start: 4
+        keep_end: 4
+    - name: "bank_card"
+      enabled: true
+      strategy: "mask"
+      params:
+        keep_start: 6
+        keep_end: 4
+    - name: "token"
+      enabled: true
+      strategy: "replace"
+      params:
+        replacement: "[REDACTED_TOKEN]"
+    - name: "session"
+      enabled: true
+      strategy: "replace"
+      params:
+        replacement: "[REDACTED_SESSION]"
+    - name: "cookie"
+      enabled: true
+      strategy: "replace"
+      params:
+        replacement: "[REDACTED_COOKIE]"
+
+  # 自定义检测规则
+  custom_rules:
+    - name: "custom_ssn"
+      enabled: true
+      pattern: "\\b\\d{3}-\\d{2}-\\d{4}\\b"
+      type: "custom"
+      strategy: "mask"
+      params:
+        keep_start: 0
+        keep_end: 4
+        mask_char: "*"
+
+  # 脱敏映射持久化配置
+  # mapping_db_path: "./sanitizer_mappings.db"
+  # hmac_key: "your-secret-key-here"  # 用于HMAC签名，保护原始值
+  mapping_in_memory: true  # 仅内存中保持一致性，不持久化
+
+# 输出配置
+output:
+  file: "./output/sanitized_logs.jsonl"
+  stdout: false
+  split_by_day: false  # 按天分割输出文件
+  overwrite: false
+  encoding: "utf-8"
+  pretty: false  # 格式化JSON输出
+
+# 处理配置
+parallelism: 4  # 并行处理的文件数，默认CPU核心数
+dry_run: false  # 只预览不实际写入
+
+# 审计报告配置
+report_file: "./output/audit_report.txt"
+report_json: "./output/audit_report.json"
