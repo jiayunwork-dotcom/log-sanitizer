@@ -21,6 +21,27 @@ class ReportGenerator:
         main_table.add_column(style="cyan")
         main_table.add_column()
         
+        if report.incremental_mode and report.total_lines == 0 and len(report.skipped_files) > 0:
+            main_table.add_row(
+                "[bold yellow]增量模式提示:",
+                "[yellow]未检测到新数据[/yellow]"
+            )
+            main_table.add_row(
+                "[bold]跳过文件:",
+                f"[yellow]{len(report.skipped_files)}[/yellow] 个文件已处理完成,无新增日志"
+            )
+            for skipped_file in report.skipped_files[:3]:
+                main_table.add_row(
+                    "  •",
+                    os.path.basename(skipped_file)
+                )
+            if len(report.skipped_files) > 3:
+                main_table.add_row(
+                    "  ...",
+                    f"[dim]另有 {len(report.skipped_files) - 3} 个文件[/dim]"
+                )
+            main_table.add_row("", "")
+        
         main_table.add_row(
             "[bold]处理时长:",
             f"[green]{duration:.2f}[/green] 秒"
@@ -30,9 +51,14 @@ class ReportGenerator:
             f"[green]{throughput:.0f}[/green] 行/秒"
         )
         main_table.add_row(
-            "[bold]总行数:",
+            "[bold]本次处理行数:",
             f"[white]{report.total_lines:,}[/white]"
         )
+        if report.incremental_mode and report.total_lines > 0:
+            main_table.add_row(
+                "[bold]增量模式:",
+                "[cyan]已启用[/cyan] (处理新增数据)"
+            )
         main_table.add_row(
             "[bold]解析成功:",
             f"[green]{report.parsed_lines:,}[/green]"
@@ -104,10 +130,17 @@ class ReportGenerator:
             main_table.add_row("[bold]Top 5 脱敏字段:", "")
             main_table.add_row(Panel(top_table, border_style="cyan"), "")
         
+        if report.incremental_mode and report.total_lines == 0 and len(report.skipped_files) > 0:
+            title = "[bold yellow]⚡ 增量处理完成[/bold yellow] [dim](无新数据)[/dim]"
+            border_style = "yellow"
+        else:
+            title = "[bold green]✓ 处理完成[/bold green]"
+            border_style = "green"
+        
         return Panel(
             main_table,
-            title="[bold green]✓ 处理完成[/bold green]",
-            border_style="green",
+            title=title,
+            border_style=border_style,
             padding=(1, 2),
         )
     
@@ -252,6 +285,9 @@ class ReportAccumulator:
         
         for field_path, count in stats.field_path_counts.items():
             self.report.field_path_counts[field_path] = self.report.field_path_counts.get(field_path, 0) + count
+        
+        if stats.skipped_no_new_data:
+            self.report.skipped_files.append(file_path)
         
         self.report.file_stats[file_path] = stats
 

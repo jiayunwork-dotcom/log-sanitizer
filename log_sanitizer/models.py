@@ -104,6 +104,9 @@ class FileStats:
     detections: Dict[SensitiveType, int] = field(default_factory=dict)
     field_path_counts: Dict[str, int] = field(default_factory=dict)
     bytes_processed: int = 0
+    skipped_no_new_data: bool = False
+    start_offset: int = 0
+    end_offset: int = 0
 
 
 @dataclass
@@ -148,3 +151,5 @@ class AuditReport:
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
     field_path_counts: Dict[str, int] = field(default_factory=dict)
+    skipped_files: List[str] = field(default_factory=list)
+    incremental_mode: bool = False

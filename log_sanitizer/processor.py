@@ -4,6 +4,7 @@ import glob
 import json
 import sys
 import io
+import codecs
 from typing import List, Optional, Dict, Any, Generator, Tuple
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
@@ -178,6 +179,113 @@ class LogProcessor:
         except Exception as e:
             print(f"[WARNING] Failed to reload sanitization rules, keeping old rules: {e}", file=sys.stderr, flush=True)
     
+    def _process_line(
+        self,
+        text_line: str,
+        line_bytes: int,
+        stats: FileStats,
+        parser: LogParser,
+        file_path: str,
+        preview_records: List[Tuple[str, str]],
+    ) -> None:
+        entry = parser.parse_line(text_line)
+        
+        if entry.is_parseable:
+            stats.parsed_lines += 1
+        else:
+            stats.unparsed_lines += 1
+            if not self.config.dry_run:
+                self._write_output(entry, file_path)
+            return
+        
+        if not self.should_keep(entry):
+            return
+        
+        original_message = entry.message
+        entry, detections, sanitized, total_fields, audit_entries, field_path_counts = self.sanitizer.sanitize_entry(entry)
+        
+        stats.sanitized_fields += sanitized
+        stats.total_fields += total_fields
+        
+        for stype, count in detections.items():
+            stats.detections[stype] = stats.detections.get(stype, 0) + count
+        
+        for f_path, count in field_path_counts.items():
+            stats.field_path_counts[f_path] = stats.field_path_counts.get(f_path, 0) + count
+        
+        if self.audit_logger and audit_entries:
+            for f_path, orig_val, sanitized_val, rule_name in audit_entries:
+                self.audit_logger.log(
+                    line_number=stats.total_lines,
+                    field_path=f_path,
+                    original_value=orig_val,
+                    sanitized_value=sanitized_val,
+                    rule_name=rule_name,
+                    timestamp=entry.timestamp,
+                )
+        
+        if self.config.dry_run and len(preview_records) < 20:
+            preview_records.append((original_message, entry.message))
+        
+        if not self.config.dry_run:
+            self._write_output(entry, file_path)
+    
+    def _read_lines_with_offset(
+        self,
+        file_path: str,
+        start_offset: int,
+        encoding: str,
+    ) -> Generator[Tuple[str, int], None, None]:
+        with open(file_path, 'rb') as f_bin:
+            if start_offset > 0:
+                f_bin.seek(start_offset)
+            
+            decoder = codecs.getincrementaldecoder(encoding)(errors='replace')
+            buffer = ''
+            
+            while True:
+                chunk = f_bin.read(65536)
+                if not chunk:
+                    remaining = decoder.decode(b'', final=True)
+                    if remaining:
+                        lines = remaining.splitlines(keepends=True)
+                        for line in lines:
+                            has_newline = line.endswith('\n') or line.endswith('\r\n') or line.endswith('\r')
+                            if has_newline or remaining.rstrip('\r\n'):
+                                if has_newline:
+                                    line_bytes = len(line.encode(encoding))
+                                else:
+                                    line_bytes = len(line.encode(encoding))
+                                text_line = line.rstrip('\r\n')
+                                yield text_line, line_bytes
+                    break
+                
+                buffer += decoder.decode(chunk, final=False)
+                
+                while True:
+                    newline_pos = -1
+                    newline_len = 0
+                    
+                    if '\r\n' in buffer:
+                        newline_pos = buffer.index('\r\n')
+                        newline_len = 2
+                    elif '\n' in buffer:
+                        newline_pos = buffer.index('\n')
+                        newline_len = 1
+                    elif '\r' in buffer:
+                        newline_pos = buffer.index('\r')
+                        newline_len = 1
+                    
+                    if newline_pos < 0:
+                        break
+                    
+                    line = buffer[:newline_pos + newline_len]
+                    buffer = buffer[newline_pos + newline_len:]
+                    
+                    line_bytes = len(line.encode(encoding))
+                    text_line = line.rstrip('\r\n')
+                    yield text_line, line_bytes
+    
     def process_file(self, file_path: str, show_progress: bool = True, progress_callback=None) -> Tuple[FileStats, List[Tuple[str, str]]]:
         stats = FileStats(file_path=file_path)
         parser = LogParser(
@@ -196,9 +304,32 @@ class LogProcessor:
         current_offset = start_offset
         total_lines = self.count_lines(file_path, self.config.inputs.encoding)
         
+        try:
+            file_size = os.path.getsize(file_path)
+        except OSError:
+            file_size = 0
+        
+        stats.start_offset = start_offset
+        stats.end_offset = start_offset
+        
+        if self.state_manager and start_offset >= file_size and file_size > 0:
+            stats.skipped_no_new_data = True
+            stats.end_offset = start_offset
+            return stats, preview_records
+        
+        initial_lines = 0
+        if start_offset > 0:
+            with open(file_path, 'rb') as f:
+                f.seek(0)
+                while f.tell() < start_offset:
+                    line = f.readline()
+                    if not line:
+                        break
+                    initial_lines += 1
+        
         pbar = tqdm(
             total=total_lines,
-            initial=0,
+            initial=initial_lines,
             desc=f"Processing {os.path.basename(file_path)}",
             unit="lines",
             disable=not show_progress,
@@ -206,71 +337,32 @@ class LogProcessor:
         )
         
         try:
-            with open(file_path, 'r', encoding=self.config.inputs.encoding, errors='replace') as f:
-                if start_offset > 0:
-                    f.seek(start_offset)
+            lines_processed = 0
+            for text_line, line_bytes in self._read_lines_with_offset(
+                file_path, start_offset, self.config.inputs.encoding
+            ):
+                current_offset += line_bytes
+                stats.total_lines += 1
+                stats.bytes_processed += line_bytes
+                lines_processed += 1
+                pbar.update(1)
                 
-                lines_processed = 0
-                for line in f:
-                    line_bytes = len(line.encode(self.config.inputs.encoding))
-                    current_offset += line_bytes
-                    stats.total_lines += 1
-                    stats.bytes_processed += line_bytes
-                    lines_processed += 1
-                    pbar.update(1)
-                    
-                    if lines_processed % 1000 == 0:
-                        self._check_config_hot_reload()
-                        if self.state_manager:
-                            self.state_manager.update_file_state(file_path, current_offset)
-                            self.state_manager.save()
-                        if progress_callback:
-                            progress_callback(stats.detections)
-                    
-                    entry = parser.parse_line(line)
-                    
-                    if entry.is_parseable:
-                        stats.parsed_lines += 1
-                    else:
-                        stats.unparsed_lines += 1
-                        if not self.config.dry_run:
-                            self._write_output(entry, file_path)
-                        continue
-                    
-                    if not self.should_keep(entry):
-                        continue
-                    
-                    original_message = entry.message
-                    entry, detections, sanitized, total_fields, audit_entries, field_path_counts = self.sanitizer.sanitize_entry(entry)
-                    
-                    stats.sanitized_fields += sanitized
-                    stats.total_fields += total_fields
-                    
-                    for stype, count in detections.items():
-                        stats.detections[stype] = stats.detections.get(stype, 0) + count
-                    
-                    for field_path, count in field_path_counts.items():
-                        stats.field_path_counts[field_path] = stats.field_path_counts.get(field_path, 0) + count
-                    
-                    if self.audit_logger and audit_entries:
-                        for field_path, orig_val, sanitized_val, rule_name in audit_entries:
-                            self.audit_logger.log(
-                                line_number=stats.total_lines,
-                                field_path=field_path,
-                                original_value=orig_val,
-                                sanitized_value=sanitized_val,
-                                rule_name=rule_name,
-                                timestamp=entry.timestamp,
-                            )
-                    
-                    if self.config.dry_run and len(preview_records) < 20:
-                        preview_records.append((original_message, entry.message))
-                    
-                    if not self.config.dry_run:
-                        self._write_output(entry, file_path)
+                if lines_processed % 1000 == 0:
+                    self._check_config_hot_reload()
+                    if self.state_manager:
+                        self.state_manager.update_file_state(file_path, current_offset)
+                        self.state_manager.save()
+                    if progress_callback:
+                        progress_callback(stats.detections)
+                
+                self._process_line(
+                    text_line, line_bytes, stats, parser, file_path, preview_records
+                )
         
         finally:
-            pbar.close()
+            stats.end_offset = current_offset
+            if 'pbar' in locals():
+                pbar.close()
             if self.state_manager:
                 self.state_manager.update_file_state(file_path, current_offset)
                 self.state_manager.save()
@@ -360,6 +452,7 @@ class LogProcessor:
             raise ValueError("No input files found")
         
         accumulator = ReportAccumulator()
+        accumulator.report.incremental_mode = self.config.incremental
         all_preview: List[Tuple[str, str, str]] = []
         
         try:
