@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 from .models import AnomalyDetectionState
 from .anomaly_detectors import FrequencyDetector, ErrorRateDetector, PatternDetector
+from .suppression_engine import SuppressionEngine
+from .feedback_processor import FeedbackProcessor
 
 
 class StatePersistence:
@@ -22,6 +24,8 @@ class StatePersistence:
         frequency_detector: FrequencyDetector,
         error_rate_detector: ErrorRateDetector,
         pattern_detector: PatternDetector,
+        suppression_engine: Optional[SuppressionEngine] = None,
+        feedback_processor: Optional[FeedbackProcessor] = None,
         force: bool = False,
     ) -> None:
         if not self.state_file_path:
@@ -44,6 +48,16 @@ class StatePersistence:
 
                 for source, ps in pattern_detector.states.items():
                     state.pattern_states[source] = ps
+
+                if feedback_processor:
+                    active, acknowledged, resolved = feedback_processor.get_alert_states()
+                    state.active_alerts = active
+                    state.acknowledged_alerts = acknowledged
+                    state.resolved_alerts = resolved
+                    state.threshold_overrides = feedback_processor.get_threshold_overrides()
+
+                if suppression_engine:
+                    state.suppression_rule_stats = suppression_engine.to_dict()
 
                 state_dir = os.path.dirname(os.path.abspath(self.state_file_path))
                 if state_dir:
@@ -73,6 +87,8 @@ class StatePersistence:
         frequency_detector: FrequencyDetector,
         error_rate_detector: ErrorRateDetector,
         pattern_detector: PatternDetector,
+        suppression_engine: Optional[SuppressionEngine] = None,
+        feedback_processor: Optional[FeedbackProcessor] = None,
     ) -> None:
         if not self.state_file_path or not os.path.exists(self.state_file_path):
             return
@@ -81,6 +97,8 @@ class StatePersistence:
             try:
                 with open(self.state_file_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
+
+                state = AnomalyDetectionState.from_dict(data)
 
                 freq_states = data.get('frequency_states', {})
                 for source, state_dict in freq_states.items():
@@ -94,6 +112,22 @@ class StatePersistence:
                 for source, state_dict in pat_states.items():
                     pattern_detector.load_state(source, state_dict)
 
+                if feedback_processor:
+                    feedback_processor.load_alert_states(
+                        state.active_alerts,
+                        state.acknowledged_alerts,
+                        state.resolved_alerts,
+                    )
+                    feedback_processor.load_threshold_overrides(state.threshold_overrides)
+
+                    for source, value in state.threshold_overrides.get('frequency', {}).items():
+                        frequency_detector.set_threshold_override(source, value)
+                    for source, value in state.threshold_overrides.get('error_rate', {}).items():
+                        error_rate_detector.set_threshold_override(source, value)
+
+                if suppression_engine and state.suppression_rule_stats:
+                    suppression_engine.load_rule_stats(state.suppression_rule_stats)
+
                 print(f"Anomaly detection state loaded successfully from {self.state_file_path}", flush=True)
 
             except (json.JSONDecodeError, KeyError, ValueError) as e:
@@ -105,12 +139,25 @@ class StatePersistence:
         frequency_detector: FrequencyDetector,
         error_rate_detector: ErrorRateDetector,
         pattern_detector: PatternDetector,
+        suppression_engine: Optional[SuppressionEngine] = None,
+        feedback_processor: Optional[FeedbackProcessor] = None,
     ) -> None:
         frequency_detector.reset_source(source)
         error_rate_detector.reset_source(source)
         pattern_detector.reset_source(source)
+        if source in frequency_detector.threshold_overrides:
+            del frequency_detector.threshold_overrides[source]
+        if source in error_rate_detector.threshold_overrides:
+            del error_rate_detector.threshold_overrides[source]
         self.mark_dirty()
-        self.save_state(frequency_detector, error_rate_detector, pattern_detector, force=True)
+        self.save_state(
+            frequency_detector,
+            error_rate_detector,
+            pattern_detector,
+            suppression_engine,
+            feedback_processor,
+            force=True,
+        )
 
     def get_state(self) -> Optional[Dict[str, Any]]:
         if not self.state_file_path or not os.path.exists(self.state_file_path):

@@ -177,6 +177,68 @@ class DetectorName(str, Enum):
     PATTERN = "pattern_detector"
 
 
+class AlertStatus(str, Enum):
+    ACTIVE = "active"
+    ACKNOWLEDGED = "acknowledged"
+    RESOLVED = "resolved"
+
+
+class SuppressionAction(str, Enum):
+    SUPPRESS = "suppress"
+    DOWNGRADE = "downgrade"
+    DELAY = "delay"
+
+
+class FeedbackAction(str, Enum):
+    ACKNOWLEDGE = "acknowledge"
+    RESOLVE = "resolve"
+    REOPEN = "reopen"
+
+
+@dataclass
+class SuppressionRuleMatch:
+    source_pattern: Optional[str] = None
+    alert_types: Optional[List[AlertType]] = None
+    severities: Optional[List[AlertSeverity]] = None
+    cron_expression: Optional[str] = None
+
+
+@dataclass
+class SuppressionRule:
+    name: str
+    match: SuppressionRuleMatch
+    action: SuppressionAction
+    enabled: bool = True
+    delay_seconds: int = 0
+    hit_count: int = 0
+    last_hit_time: Optional[datetime] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "match": {
+                "source_pattern": self.match.source_pattern,
+                "alert_types": [t.value for t in self.match.alert_types] if self.match.alert_types else None,
+                "severities": [s.value for s in self.match.severities] if self.match.severities else None,
+                "cron_expression": self.match.cron_expression,
+            },
+            "action": self.action.value,
+            "enabled": self.enabled,
+            "delay_seconds": self.delay_seconds,
+            "hit_count": self.hit_count,
+            "last_hit_time": self.last_hit_time.isoformat() if self.last_hit_time else None,
+        }
+
+
+@dataclass
+class PendingAlert:
+    alert: AlertEvent
+    rule_name: str
+    delay_until: datetime
+    check_alert_type: AlertType
+    check_source: str
+
+
 @dataclass
 class AlertEvent:
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
@@ -191,6 +253,9 @@ class AlertEvent:
     line_range: Optional[Tuple[int, int]] = None
     description: str = ""
     extra: Dict[str, Any] = field(default_factory=dict)
+    status: AlertStatus = AlertStatus.ACTIVE
+    acknowledged_at: Optional[datetime] = None
+    resolved_at: Optional[datetime] = None
 
     @staticmethod
     def _sanitize_float(value: Any) -> Any:
@@ -222,7 +287,34 @@ class AlertEvent:
             "line_range": list(self.line_range) if self.line_range else None,
             "description": self.description,
             "extra": self._sanitize_value(self.extra),
+            "status": self.status.value,
+            "acknowledged_at": self.acknowledged_at.isoformat() if self.acknowledged_at else None,
+            "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
         }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'AlertEvent':
+        from datetime import timezone
+        alert = cls(
+            id=data.get('id', str(uuid.uuid4())),
+            timestamp=datetime.fromisoformat(data['timestamp'].replace('Z', '+00:00')) if data.get('timestamp') else datetime.now(timezone.utc),
+            severity=AlertSeverity(data.get('severity', 'WARNING')),
+            alert_type=AlertType(data.get('alert_type', 'frequency_spike')),
+            source=data.get('source', ''),
+            detector=DetectorName(data.get('detector', 'frequency_detector')),
+            trigger_value=float(data.get('trigger_value', 0.0)),
+            threshold=float(data.get('threshold', 0.0)),
+            baseline_value=float(data['baseline_value']) if data.get('baseline_value') is not None else None,
+            line_range=tuple(data['line_range']) if data.get('line_range') else None,
+            description=data.get('description', ''),
+            extra=data.get('extra', {}),
+            status=AlertStatus(data.get('status', 'active')),
+        )
+        if data.get('acknowledged_at'):
+            alert.acknowledged_at = datetime.fromisoformat(data['acknowledged_at'].replace('Z', '+00:00'))
+        if data.get('resolved_at'):
+            alert.resolved_at = datetime.fromisoformat(data['resolved_at'].replace('Z', '+00:00'))
+        return alert
 
 
 @dataclass
@@ -252,10 +344,15 @@ class PatternState:
 
 @dataclass
 class AnomalyDetectionState:
-    version: str = "1.0"
+    version: str = "2.0"
     frequency_states: Dict[str, FrequencyState] = field(default_factory=dict)
     error_rate_states: Dict[str, ErrorRateState] = field(default_factory=dict)
     pattern_states: Dict[str, PatternState] = field(default_factory=dict)
+    active_alerts: Dict[str, AlertEvent] = field(default_factory=dict)
+    acknowledged_alerts: Dict[str, AlertEvent] = field(default_factory=dict)
+    resolved_alerts: List[AlertEvent] = field(default_factory=list)
+    threshold_overrides: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    suppression_rule_stats: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     last_updated: Optional[datetime] = None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -291,7 +388,37 @@ class AnomalyDetectionState:
                 }
                 for source, ps in self.pattern_states.items()
             },
+            "active_alerts": {
+                alert_id: alert.to_dict()
+                for alert_id, alert in self.active_alerts.items()
+            },
+            "acknowledged_alerts": {
+                alert_id: alert.to_dict()
+                for alert_id, alert in self.acknowledged_alerts.items()
+            },
+            "resolved_alerts": [
+                alert.to_dict() for alert in self.resolved_alerts
+            ],
+            "threshold_overrides": self.threshold_overrides,
+            "suppression_rule_stats": self.suppression_rule_stats,
         }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'AnomalyDetectionState':
+        state = cls(
+            version=data.get('version', '2.0'),
+            threshold_overrides=data.get('threshold_overrides', {}),
+            suppression_rule_stats=data.get('suppression_rule_stats', {}),
+        )
+        if data.get('last_updated'):
+            state.last_updated = datetime.fromisoformat(data['last_updated'].replace('Z', '+00:00'))
+        for alert_id, alert_data in data.get('active_alerts', {}).items():
+            state.active_alerts[alert_id] = AlertEvent.from_dict(alert_data)
+        for alert_id, alert_data in data.get('acknowledged_alerts', {}).items():
+            state.acknowledged_alerts[alert_id] = AlertEvent.from_dict(alert_data)
+        for alert_data in data.get('resolved_alerts', []):
+            state.resolved_alerts.append(AlertEvent.from_dict(alert_data))
+        return state
 
 
 @dataclass
@@ -301,3 +428,7 @@ class AlertStats:
     by_type: Dict[AlertType, int] = field(default_factory=dict)
     by_source: Dict[str, int] = field(default_factory=dict)
     by_detector: Dict[DetectorName, int] = field(default_factory=dict)
+    by_status: Dict[AlertStatus, int] = field(default_factory=dict)
+    suppressed_count: int = 0
+    delayed_count: int = 0
+    downgraded_count: int = 0

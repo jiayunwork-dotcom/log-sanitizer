@@ -582,15 +582,18 @@ def anomaly_status(
 
         main_table.add_row("状态", "[green]已启用[/green]")
         main_table.add_row("队列大小", str(status.get("queue_size", 0)))
+        main_table.add_row("待处理延迟告警", str(status.get("pending_delayed_alerts", 0)))
         main_table.add_row("活跃Sources", ", ".join(status.get("active_sources", [])) or "无")
         main_table.add_row("状态文件", status.get("state_file", "未配置"))
         main_table.add_row("告警文件", status.get("alert_file", "未配置"))
+        if status.get("feedback_file"):
+            main_table.add_row("Feedback文件", status.get("feedback_file"))
 
         console.print(main_table)
         console.print()
 
         alert_stats = status.get("alert_stats", {})
-        if alert_stats.get("total_alerts", 0) > 0:
+        if alert_stats.get("total_alerts", 0) > 0 or alert_stats.get("suppressed_count", 0) > 0:
             console.print(Panel.fit(
                 "[bold]告警统计[/bold]",
                 border_style="magenta",
@@ -601,6 +604,19 @@ def anomaly_status(
             alert_table.add_column("数量", style="magenta", justify="right")
 
             alert_table.add_row("总告警数", str(alert_stats.get("total_alerts", 0)))
+            alert_table.add_row("已抑制", str(alert_stats.get("suppressed_count", 0)))
+            alert_table.add_row("已延迟", str(alert_stats.get("delayed_count", 0)))
+            alert_table.add_row("已降级", str(alert_stats.get("downgraded_count", 0)))
+
+            by_status = alert_stats.get("by_status", {})
+            if by_status:
+                console.print()
+                status_table = Table(show_header=True, header_style="bold yellow")
+                status_table.add_column("告警状态", style="cyan")
+                status_table.add_column("数量", style="yellow", justify="right")
+                for status_key, count in by_status.items():
+                    status_table.add_row(status_key, str(count))
+                console.print(status_table)
 
             by_severity = alert_stats.get("by_severity", {})
             for severity, count in by_severity.items():
@@ -619,6 +635,52 @@ def anomaly_status(
                 alert_table.add_row(f"  Detector: {detector}", str(count))
 
             console.print(alert_table)
+            console.print()
+
+        alert_status_counts = status.get("alert_status_counts", {})
+        if alert_status_counts:
+            console.print(Panel.fit(
+                "[bold]当前活跃告警状态[/bold]",
+                border_style="yellow",
+            ))
+            status_count_table = Table(show_header=True, header_style="bold yellow")
+            status_count_table.add_column("状态", style="cyan")
+            status_count_table.add_column("数量", style="yellow", justify="right")
+            for st, cnt in alert_status_counts.items():
+                status_count_table.add_row(st, str(cnt))
+            console.print(status_count_table)
+            console.print()
+
+        suppression_rules = status.get("suppression_rules", [])
+        if suppression_rules:
+            console.print(Panel.fit(
+                f"[bold]抑制规则命中统计 - 共 {len(suppression_rules)} 条[/bold]",
+                border_style="cyan",
+            ))
+            rule_table = Table(show_header=True, header_style="bold cyan")
+            rule_table.add_column("规则名称", style="cyan")
+            rule_table.add_column("动作", style="yellow")
+            rule_table.add_column("命中次数", style="red", justify="right")
+            rule_table.add_column("最近命中时间", style="dim")
+            for rule in suppression_rules:
+                if rule.get('hit_count', 0) > 0:
+                    action_map = {
+                        'suppress': '静默丢弃',
+                        'downgrade': '降级',
+                        'delay': '延迟',
+                    }
+                    action = action_map.get(rule.get('action'), rule.get('action', ''))
+                    last_hit = rule.get('last_hit_time') or "无"
+                    rule_table.add_row(
+                        rule.get('name', ''),
+                        action,
+                        str(rule.get('hit_count', 0)),
+                        last_hit,
+                    )
+            if rule_table.row_count > 0:
+                console.print(rule_table)
+            else:
+                console.print("[dim]暂无命中记录[/dim]")
             console.print()
 
         sources = status.get("sources", {})
@@ -744,6 +806,281 @@ def anomaly_replay(
                 f"{alert.get('trigger_value', 0):.4f}",
                 f"{alert.get('threshold', 0):.4f}",
                 alert.get("description", "")[:80],
+            )
+
+        console.print(table)
+
+    except Exception as e:
+        console.print(f"[bold red]错误:[/bold red] {str(e)}")
+        raise typer.Exit(code=1)
+
+
+@anomaly_app.command("feedback")
+def anomaly_feedback(
+    config: Path = typer.Option(
+        ...,
+        "--config",
+        "-c",
+        help="Pipeline配置文件路径(YAML格式)",
+        exists=True,
+        readable=True,
+    ),
+    file: Path = typer.Option(
+        ...,
+        "--file",
+        "-f",
+        help="Feedback文件路径(JSON Lines格式)",
+        exists=True,
+        readable=True,
+    ),
+):
+    """
+    手动加载feedback文件，实时更新阈值和告警状态
+    """
+    try:
+        from .anomaly_engine import AnomalyDetectionEngine
+        from .config import ConfigLoader
+        from .state_persistence import StatePersistence
+
+        pipeline_config = ConfigLoader.load(str(config))
+
+        if not pipeline_config.anomaly_detection.enabled:
+            console.print("[yellow]异常检测未启用[/yellow]")
+            return
+
+        engine = AnomalyDetectionEngine(pipeline_config.anomaly_detection)
+        result = engine.process_feedback(str(file))
+
+        console.print(Panel.fit(
+            "[bold]Feedback处理结果[/bold]",
+            border_style="blue",
+        ))
+
+        table = Table(show_header=False, box=None)
+        table.add_column("项目", style="cyan", width=20)
+        table.add_column("值", style="green")
+
+        table.add_row("处理的反馈条目", str(result.get('total_processed', 0)))
+        table.add_row("阈值调整次数", str(result.get('threshold_adjustments', 0)))
+        table.add_row("状态变更次数", str(result.get('status_changes', 0)))
+        table.add_row("错误数", str(result.get('errors', 0)))
+
+        console.print(table)
+
+        if result.get('errors', 0) > 0:
+            console.print(f"\n[yellow]警告: 处理过程中出现 {result['errors']} 条错误[/yellow]")
+
+        if result.get('threshold_adjustments', 0) > 0 or result.get('status_changes', 0) > 0:
+            state_persistence = StatePersistence(pipeline_config.anomaly_detection.state_file)
+            state_persistence.mark_dirty()
+            state_persistence.save_state(
+                engine.frequency_detector,
+                engine.error_rate_detector,
+                engine.pattern_detector,
+                engine.suppression_engine,
+                engine.feedback_processor,
+                force=True,
+            )
+            console.print("\n[green]状态已持久化[/green]")
+
+    except Exception as e:
+        console.print(f"[bold red]错误:[/bold red] {str(e)}")
+        raise typer.Exit(code=1)
+
+
+@anomaly_app.command("rules")
+def anomaly_rules(
+    config: Path = typer.Option(
+        ...,
+        "--config",
+        "-c",
+        help="Pipeline配置文件路径(YAML格式)",
+        exists=True,
+        readable=True,
+    ),
+):
+    """
+    列出当前生效的抑制规则及命中统计
+    """
+    try:
+        from .anomaly_engine import AnomalyDetectionEngine
+        from .config import ConfigLoader
+
+        pipeline_config = ConfigLoader.load(str(config))
+
+        if not pipeline_config.anomaly_detection.enabled:
+            console.print("[yellow]异常检测未启用[/yellow]")
+            return
+
+        engine = AnomalyDetectionEngine(pipeline_config.anomaly_detection)
+        rules = engine.get_suppression_rules()
+
+        if not rules:
+            console.print("[yellow]未配置抑制规则[/yellow]")
+            return
+
+        console.print(Panel.fit(
+            f"[bold]抑制规则列表 - 共 {len(rules)} 条[/bold]",
+            border_style="blue",
+        ))
+
+        table = Table(show_header=True, header_style="bold blue")
+        table.add_column("规则名称", style="cyan")
+        table.add_column("状态", style="magenta")
+        table.add_column("动作", style="yellow")
+        table.add_column("匹配条件", style="green")
+        table.add_column("延迟(秒)", justify="right")
+        table.add_column("命中次数", style="red", justify="right")
+        table.add_column("最近命中时间", style="dim")
+
+        for rule in rules:
+            status = "[green]启用[/green]" if rule.get('enabled', True) else "[red]禁用[/red]"
+            action_map = {
+                'suppress': '[red]静默丢弃[/red]',
+                'downgrade': '[yellow]降级[/yellow]',
+                'delay': '[blue]延迟[/blue]',
+            }
+            action = action_map.get(rule.get('action'), rule.get('action', ''))
+
+            match_conditions = []
+            m = rule.get('match', {})
+            if m.get('source_pattern'):
+                match_conditions.append(f"source: {m['source_pattern']}")
+            if m.get('alert_types'):
+                match_conditions.append(f"types: {', '.join(m['alert_types'])}")
+            if m.get('severities'):
+                match_conditions.append(f"levels: {', '.join(m['severities'])}")
+            if m.get('cron_expression'):
+                match_conditions.append(f"cron: {m['cron_expression']}")
+            match_str = "\n".join(match_conditions) if match_conditions else "[dim]无限制[/dim]"
+
+            hit_count = str(rule.get('hit_count', 0))
+            last_hit = rule.get('last_hit_time') or "无"
+
+            table.add_row(
+                rule.get('name', ''),
+                status,
+                action,
+                match_str,
+                str(rule.get('delay_seconds', 0)),
+                hit_count,
+                last_hit,
+            )
+
+        console.print(table)
+
+    except Exception as e:
+        console.print(f"[bold red]错误:[/bold red] {str(e)}")
+        raise typer.Exit(code=1)
+
+
+@anomaly_app.command("alerts")
+def anomaly_alerts(
+    config: Path = typer.Option(
+        ...,
+        "--config",
+        "-c",
+        help="Pipeline配置文件路径(YAML格式)",
+        exists=True,
+        readable=True,
+    ),
+    state: Optional[str] = typer.Option(
+        None,
+        "--state",
+        "-s",
+        help="按状态筛选: active|acknowledged|resolved",
+    ),
+    source: Optional[str] = typer.Option(
+        None,
+        "--source",
+        help="按source正则筛选",
+    ),
+    sort_by: str = typer.Option(
+        "timestamp",
+        "--sort-by",
+        help="排序方式: timestamp|severity|source",
+    ),
+):
+    """
+    按条件筛选并展示告警列表
+    """
+    try:
+        from .anomaly_engine import AnomalyDetectionEngine
+        from .config import ConfigLoader
+        from .models import AlertStatus
+
+        pipeline_config = ConfigLoader.load(str(config))
+
+        if not pipeline_config.anomaly_detection.enabled:
+            console.print("[yellow]异常检测未启用[/yellow]")
+            return
+
+        engine = AnomalyDetectionEngine(pipeline_config.anomaly_detection)
+
+        status_filter = None
+        if state:
+            try:
+                status_filter = AlertStatus(state.lower())
+            except ValueError:
+                console.print(f"[bold red]错误:[/bold red] 无效的状态值 '{state}'，有效值: active, acknowledged, resolved")
+                raise typer.Exit(code=1)
+
+        if sort_by not in ('timestamp', 'severity', 'source'):
+            console.print(f"[bold red]错误:[/bold red] 无效的排序方式 '{sort_by}'，有效值: timestamp, severity, source")
+            raise typer.Exit(code=1)
+
+        alerts = engine.get_alerts(
+            status=status_filter,
+            source_pattern=source,
+            sort_by=sort_by,
+        )
+
+        if not alerts:
+            console.print("[yellow]未找到匹配的告警[/yellow]")
+            return
+
+        status_str = status_filter.value if status_filter else "全部"
+        console.print(Panel.fit(
+            f"[bold]告警列表 - 共 {len(alerts)} 条 (状态: {status_str}[/bold]",
+            border_style="blue",
+        ))
+
+        table = Table(show_header=True, header_style="bold blue")
+        table.add_column("时间", style="cyan", width=25)
+        table.add_column("状态", style="magenta")
+        table.add_column("级别", style="yellow")
+        table.add_column("类型", style="green")
+        table.add_column("Source", style="blue")
+        table.add_column("检测器", style="dim")
+        table.add_column("触发值", style="red", justify="right")
+        table.add_column("阈值", justify="right")
+        table.add_column("描述", style="dim")
+
+        for alert in alerts:
+            severity = alert.severity.value
+            severity_style = {
+                "INFO": "green",
+                "WARNING": "yellow",
+                "CRITICAL": "red",
+            }.get(severity, "white")
+
+            alert_status = alert.status.value
+            status_style = {
+                "active": "[red]●[/red] Active",
+                "acknowledged": "[yellow]●[/yellow] Ack",
+                "resolved": "[green]●[/green] Resolved",
+            }.get(alert_status, alert_status)
+
+            table.add_row(
+                alert.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                status_style,
+                f"[{severity_style}]{severity}[/{severity_style}]",
+                alert.alert_type.value,
+                alert.source,
+                alert.detector.value,
+                f"{alert.trigger_value:.4f}",
+                f"{alert.threshold:.4f}",
+                alert.description[:80],
             )
 
         console.print(table)

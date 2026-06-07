@@ -9,21 +9,34 @@ from .models import (
     AlertType,
     DetectorName,
     AlertStats,
+    AlertStatus,
 )
 from .config import AnomalyDetectionConfig
+from .suppression_engine import SuppressionEngine
+from .feedback_processor import FeedbackProcessor
 
 
 class AlertAggregator:
-    def __init__(self, config: AnomalyDetectionConfig):
+    def __init__(self, config: AnomalyDetectionConfig,
+                 suppression_engine: Optional[SuppressionEngine] = None,
+                 feedback_processor: Optional[FeedbackProcessor] = None):
         self.config = config
         self._lock = threading.Lock()
         self._last_alert_time: Dict[Tuple[str, AlertType], datetime] = {}
         self._pending_alerts: Dict[str, Dict[AlertType, AlertEvent]] = defaultdict(dict)
         self._output_callback: Optional[Callable[[AlertEvent], None]] = None
+        self._suppression_engine = suppression_engine
+        self._feedback_processor = feedback_processor
         self.stats = AlertStats()
 
     def set_output_callback(self, callback: Callable[[AlertEvent], None]) -> None:
         self._output_callback = callback
+
+    def set_suppression_engine(self, engine: SuppressionEngine) -> None:
+        self._suppression_engine = engine
+
+    def set_feedback_processor(self, processor: FeedbackProcessor) -> None:
+        self._feedback_processor = processor
 
     def process_alert(self, alert: AlertEvent) -> None:
         if self._is_suppressed(alert):
@@ -124,10 +137,37 @@ class AlertAggregator:
         )
 
     def _emit_alert(self, alert: AlertEvent) -> None:
-        self._update_stats(alert)
+        processed_alert = alert
+
+        if self._suppression_engine:
+            result = self._suppression_engine.process_alert(alert)
+            if result is None:
+                if self._suppression_engine:
+                    action = 'suppressed'
+                    if hasattr(alert, 'extra') and alert.extra.get('suppression_action') == 'delayed_kept':
+                        pass
+                    elif hasattr(alert, 'extra') and alert.extra.get('suppression_action'):
+                        action = alert.extra['suppression_action']
+                    if action == 'suppressed':
+                        self.stats.suppressed_count += 1
+                    elif action == 'delayed':
+                        self.stats.delayed_count += 1
+                return
+            processed_alert = result
+
+            if processed_alert.extra.get('suppression_action') == 'downgraded':
+                self.stats.downgraded_count += 1
+
+            self._suppression_engine.record_alert(processed_alert)
+
+        if self._feedback_processor:
+            self._feedback_processor.register_alert(processed_alert)
+
+        self._update_stats(processed_alert)
+
         if self._output_callback:
             try:
-                self._output_callback(alert)
+                self._output_callback(processed_alert)
             except Exception as e:
                 print(f"Error in alert output callback: {e}", flush=True)
 
@@ -137,6 +177,7 @@ class AlertAggregator:
         self.stats.by_type[alert.alert_type] = self.stats.by_type.get(alert.alert_type, 0) + 1
         self.stats.by_source[alert.source] = self.stats.by_source.get(alert.source, 0) + 1
         self.stats.by_detector[alert.detector] = self.stats.by_detector.get(alert.detector, 0) + 1
+        self.stats.by_status[alert.status] = self.stats.by_status.get(alert.status, 0) + 1
 
     def flush_pending(self) -> None:
         with self._lock:
@@ -146,6 +187,9 @@ class AlertAggregator:
                     self._emit_alert(alert)
             self._pending_alerts.clear()
 
+        if self._suppression_engine:
+            self._suppression_engine.flush_pending()
+
     def get_stats(self) -> AlertStats:
         with self._lock:
             return AlertStats(
@@ -154,6 +198,10 @@ class AlertAggregator:
                 by_type=dict(self.stats.by_type),
                 by_source=dict(self.stats.by_source),
                 by_detector=dict(self.stats.by_detector),
+                by_status=dict(self.stats.by_status),
+                suppressed_count=self.stats.suppressed_count,
+                delayed_count=self.stats.delayed_count,
+                downgraded_count=self.stats.downgraded_count,
             )
 
     def reset_stats(self) -> None:

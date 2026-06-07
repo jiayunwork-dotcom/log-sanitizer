@@ -4,7 +4,7 @@ import time
 import json
 from typing import Optional, Set, Dict, Any, Tuple, List
 from datetime import datetime, timezone
-from .models import LogEntry, AlertEvent, AlertStats
+from .models import LogEntry, AlertEvent, AlertStats, AlertStatus
 from .config import AnomalyDetectionConfig
 from .event_bus import EventBus
 from .anomaly_detectors import (
@@ -15,6 +15,8 @@ from .anomaly_detectors import (
 from .alert_aggregator import AlertAggregator
 from .alert_output import AlertOutput
 from .state_persistence import StatePersistence
+from .suppression_engine import SuppressionEngine
+from .feedback_processor import FeedbackProcessor
 
 
 class AnomalyDetectionEngine:
@@ -25,6 +27,7 @@ class AnomalyDetectionEngine:
         self.queue: Optional[queue.Queue[Optional[Tuple[LogEntry, int, int]]]] = None
         self._stop_event = threading.Event()
         self._worker_thread: Optional[threading.Thread] = None
+        self._pending_check_thread: Optional[threading.Thread] = None
         self._active_sources: Set[str] = set()
         self._current_file_line_start: int = 0
         self._current_file_line_end: int = 0
@@ -34,6 +37,8 @@ class AnomalyDetectionEngine:
         self.alert_aggregator: Optional[AlertAggregator] = None
         self.alert_output: Optional[AlertOutput] = None
         self.state_persistence: Optional[StatePersistence] = None
+        self.suppression_engine: Optional[SuppressionEngine] = None
+        self.feedback_processor: Optional[FeedbackProcessor] = None
 
         if not self.enabled:
             return
@@ -57,23 +62,107 @@ class AnomalyDetectionEngine:
             config.min_samples,
         )
 
-        self.alert_aggregator = AlertAggregator(config)
+        self.suppression_engine = SuppressionEngine(config)
+        self.feedback_processor = FeedbackProcessor(config)
+
+        self.alert_aggregator = AlertAggregator(
+            config,
+            suppression_engine=self.suppression_engine,
+            feedback_processor=self.feedback_processor,
+        )
         self.alert_output = AlertOutput(
             config.alert_file,
             config.webhook,
         )
         self.state_persistence = StatePersistence(config.state_file)
 
+        self.feedback_processor.set_detectors(
+            self.frequency_detector,
+            self.error_rate_detector,
+        )
+        self.feedback_processor.set_status_change_callback(
+            self._on_alert_status_change
+        )
+        self.suppression_engine.set_output_callback(
+            self._on_delayed_alert_ready
+        )
+
         self._setup_event_subscriptions()
         self.state_persistence.load_state(
             self.frequency_detector,
             self.error_rate_detector,
             self.pattern_detector,
+            self.suppression_engine,
+            self.feedback_processor,
         )
+
+        if config.feedback_file:
+            self._load_initial_feedback(config.feedback_file)
 
     def _setup_event_subscriptions(self) -> None:
         self.event_bus.subscribe('*', self.alert_aggregator.process_alert)
         self.alert_aggregator.set_output_callback(self.alert_output.write_alert)
+
+    def _on_alert_status_change(self, alert: AlertEvent, old_status, new_status) -> None:
+        if self.alert_output:
+            self.alert_output.send_status_change(alert, old_status, new_status)
+
+    def _on_delayed_alert_ready(self, alert: AlertEvent) -> None:
+        if self.alert_output:
+            self.alert_output.write_alert(alert)
+
+    def _load_initial_feedback(self, file_path: str) -> None:
+        try:
+            result = self.feedback_processor.process_feedback_file(file_path)
+            print(f"Loaded initial feedback: {result['total_processed']} entries, "
+                  f"{result['threshold_adjustments']} threshold adjustments, "
+                  f"{result['status_changes']} status changes", flush=True)
+        except Exception as e:
+            print(f"Warning: Failed to load initial feedback file: {e}", flush=True)
+
+    def _pending_check_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                if self.suppression_engine:
+                    self.suppression_engine.check_pending_alerts()
+                time.sleep(1.0)
+            except Exception as e:
+                print(f"Error in pending check loop: {e}", flush=True)
+
+    def process_feedback(self, file_path: str) -> Dict[str, Any]:
+        if not self.enabled or not self.feedback_processor:
+            return {"error": "Anomaly detection not enabled"}
+        return self.feedback_processor.process_feedback_file(file_path)
+
+    def get_suppression_rules(self) -> List[Dict[str, Any]]:
+        if not self.enabled or not self.suppression_engine:
+            return []
+        return self.suppression_engine.get_rule_stats()
+
+    def get_alerts(self, status: Optional[AlertStatus] = None,
+                   source_pattern: Optional[str] = None,
+                   sort_by: str = 'timestamp') -> List[AlertEvent]:
+        if not self.enabled or not self.feedback_processor:
+            return []
+
+        if status:
+            alerts = self.feedback_processor.get_alerts_by_status(status)
+        else:
+            alerts = self.feedback_processor.get_all_alerts()
+
+        if source_pattern:
+            import re
+            alerts = [a for a in alerts if re.search(source_pattern, a.source)]
+
+        if sort_by == 'severity':
+            severity_order = {'CRITICAL': 3, 'WARNING': 2, 'INFO': 1}
+            alerts.sort(key=lambda a: severity_order.get(a.severity.value, 0), reverse=True)
+        elif sort_by == 'source':
+            alerts.sort(key=lambda a: a.source)
+        else:
+            alerts.sort(key=lambda a: a.timestamp, reverse=True)
+
+        return alerts
 
     def start(self) -> None:
         if not self.enabled:
@@ -86,6 +175,9 @@ class AnomalyDetectionEngine:
         self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
         self._worker_thread.start()
 
+        self._pending_check_thread = threading.Thread(target=self._pending_check_loop, daemon=True)
+        self._pending_check_thread.start()
+
     def stop(self) -> None:
         if not self.enabled:
             return
@@ -96,6 +188,10 @@ class AnomalyDetectionEngine:
         if self._worker_thread:
             self._worker_thread.join(timeout=5.0)
             self._worker_thread = None
+
+        if self._pending_check_thread:
+            self._pending_check_thread.join(timeout=2.0)
+            self._pending_check_thread = None
 
         self._flush_all_detectors()
         self.alert_aggregator.flush_pending()
@@ -158,6 +254,8 @@ class AnomalyDetectionEngine:
             self.frequency_detector,
             self.error_rate_detector,
             self.pattern_detector,
+            self.suppression_engine,
+            self.feedback_processor,
             force=True,
         )
 
@@ -170,6 +268,8 @@ class AnomalyDetectionEngine:
             self.frequency_detector,
             self.error_rate_detector,
             self.pattern_detector,
+            self.suppression_engine,
+            self.feedback_processor,
         )
 
     def get_status(self) -> Dict[str, Any]:
@@ -189,11 +289,13 @@ class AnomalyDetectionEngine:
             if freq_state:
                 source_info["frequency_ewma"] = freq_state.ewma
                 source_info["frequency_window_count"] = freq_state.window_count
+                source_info["frequency_threshold_override"] = self.frequency_detector.threshold_overrides.get(source)
 
             err_state = self.error_rate_detector.states.get(source)
             if err_state:
                 source_info["error_rate_history"] = err_state.history
                 source_info["error_rate_history_length"] = len(err_state.history)
+                source_info["error_rate_threshold_override"] = self.error_rate_detector.threshold_overrides.get(source)
 
             pat_state = self.pattern_detector.states.get(source)
             if pat_state:
@@ -204,20 +306,40 @@ class AnomalyDetectionEngine:
 
         stats = self.alert_aggregator.get_stats()
 
+        suppression_rules_stats = []
+        if self.suppression_engine:
+            suppression_rules_stats = self.suppression_engine.get_rule_stats()
+
+        alert_status_counts = {}
+        if self.feedback_processor:
+            alert_status_counts = self.feedback_processor.get_status_counts()
+
+        pending_count = 0
+        if self.suppression_engine:
+            pending_count = self.suppression_engine.get_pending_count()
+
         return {
             "enabled": True,
             "queue_size": self.queue.qsize(),
+            "pending_delayed_alerts": pending_count,
             "active_sources": list(self._active_sources),
             "sources": sources,
             "alert_stats": {
                 "total_alerts": stats.total_alerts,
+                "suppressed_count": stats.suppressed_count,
+                "delayed_count": stats.delayed_count,
+                "downgraded_count": stats.downgraded_count,
                 "by_severity": {k.value: v for k, v in stats.by_severity.items()},
                 "by_type": {k.value: v for k, v in stats.by_type.items()},
                 "by_source": stats.by_source,
                 "by_detector": {k.value: v for k, v in stats.by_detector.items()},
+                "by_status": {k.value: v for k, v in stats.by_status.items()},
             },
+            "alert_status_counts": alert_status_counts,
+            "suppression_rules": suppression_rules_stats,
             "state_file": self.config.state_file,
             "alert_file": self.config.alert_file,
+            "feedback_file": self.config.feedback_file,
         }
 
     def get_alert_stats(self) -> AlertStats:

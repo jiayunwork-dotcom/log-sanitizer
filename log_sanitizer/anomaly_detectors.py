@@ -36,13 +36,32 @@ class BaseDetector:
         self.min_samples = min_samples
         self.current_line_start: int = 0
         self.current_line_end: int = 0
+        self.threshold_overrides: Dict[str, float] = {}
 
     def set_line_range(self, start: int, end: int) -> None:
         self.current_line_start = start
         self.current_line_end = end
 
+    def set_threshold_override(self, source: str, value: float) -> None:
+        self.threshold_overrides[source] = value
+
+    def get_effective_threshold(self, source: str, base_value: float) -> float:
+        return self.threshold_overrides.get(source, base_value)
+
+    def _apply_weight_to_severity(self, severity: AlertSeverity) -> AlertSeverity:
+        weight = getattr(self.config, 'weight', 1.0)
+        if weight < 0.5:
+            if severity in (AlertSeverity.WARNING, AlertSeverity.CRITICAL):
+                return AlertSeverity.INFO
+        elif weight < 0.8:
+            if severity == AlertSeverity.CRITICAL:
+                return AlertSeverity.WARNING
+        return severity
+
     def _publish_alert(self, alert: AlertEvent) -> None:
         alert.line_range = (self.current_line_start, self.current_line_end)
+        alert.severity = self._apply_weight_to_severity(alert.severity)
+        alert.extra['detector_weight'] = getattr(self.config, 'weight', 1.0)
         self.event_bus.publish(alert.alert_type.value, alert)
 
 
@@ -76,7 +95,12 @@ class FrequencyDetector(BaseDetector):
                 state.ewma = current_freq
             else:
                 new_ewma = self.config.alpha * current_freq + (1 - self.config.alpha) * state.ewma
-                threshold = state.ewma * self.config.threshold_multiplier
+
+                base_threshold = self.config.threshold_multiplier
+                if base_threshold == 'auto':
+                    base_threshold = self.config.initial_threshold_multiplier
+                effective_multiplier = self.get_effective_threshold(source, base_threshold)
+                threshold = state.ewma * effective_multiplier
 
                 if current_freq > threshold:
                     alert = AlertEvent(
@@ -87,11 +111,12 @@ class FrequencyDetector(BaseDetector):
                         trigger_value=current_freq,
                         threshold=threshold,
                         baseline_value=state.ewma,
-                        description=f"Frequency spike detected: {current_freq:.4f} entries/sec exceeds baseline {state.ewma:.4f} entries/sec by {self.config.threshold_multiplier}x",
+                        description=f"Frequency spike detected: {current_freq:.4f} entries/sec exceeds baseline {state.ewma:.4f} entries/sec by {effective_multiplier:.2f}x",
                         extra={
                             "window_size_seconds": self.config.window_size_seconds,
                             "alpha": self.config.alpha,
                             "window_count": state.window_count,
+                            "threshold_multiplier": effective_multiplier,
                         }
                     )
                     self._publish_alert(alert)
@@ -116,7 +141,12 @@ class FrequencyDetector(BaseDetector):
         current_freq = state.window_count / self.config.window_size_seconds
 
         if state.ewma is not None:
-            threshold = state.ewma * self.config.threshold_multiplier
+            base_threshold = self.config.threshold_multiplier
+            if base_threshold == 'auto':
+                base_threshold = self.config.initial_threshold_multiplier
+            effective_multiplier = self.get_effective_threshold(source, base_threshold)
+            threshold = state.ewma * effective_multiplier
+
             if current_freq > threshold:
                 alert = AlertEvent(
                     severity=AlertSeverity.WARNING,
@@ -126,11 +156,12 @@ class FrequencyDetector(BaseDetector):
                     trigger_value=current_freq,
                     threshold=threshold,
                     baseline_value=state.ewma,
-                    description=f"Frequency spike detected: {current_freq:.4f} entries/sec exceeds baseline {state.ewma:.4f} entries/sec by {self.config.threshold_multiplier}x",
+                    description=f"Frequency spike detected: {current_freq:.4f} entries/sec exceeds baseline {state.ewma:.4f} entries/sec by {effective_multiplier:.2f}x",
                     extra={
                         "window_size_seconds": self.config.window_size_seconds,
                         "alpha": self.config.alpha,
                         "window_count": state.window_count,
+                        "threshold_multiplier": effective_multiplier,
                     }
                 )
                 self._publish_alert(alert)
@@ -204,16 +235,21 @@ class ErrorRateDetector(BaseDetector):
             if len(state.history) >= 1:
                 z_score = calculate_modified_z_score(state.history, error_rate)
 
-                if z_score > self.config.z_score_threshold:
+                base_threshold = self.config.z_score_threshold
+                if base_threshold == 'auto':
+                    base_threshold = self.config.initial_z_score_threshold
+                effective_threshold = self.get_effective_threshold(source, base_threshold)
+
+                if z_score > effective_threshold:
                     alert = AlertEvent(
                         severity=AlertSeverity.WARNING,
                         alert_type=AlertType.ERROR_RATE_SURGE,
                         source=source,
                         detector=DetectorName.ERROR_RATE,
                         trigger_value=error_rate,
-                        threshold=self.config.z_score_threshold,
+                        threshold=effective_threshold,
                         baseline_value=float('inf') if z_score == float('inf') else None,
-                        description=f"Error rate surge detected: {error_rate:.4f} has Z-score {z_score:.4f} > threshold {self.config.z_score_threshold}",
+                        description=f"Error rate surge detected: {error_rate:.4f} has Z-score {z_score:.4f} > threshold {effective_threshold:.2f}",
                         extra={
                             "window_size_seconds": self.config.window_size_seconds,
                             "k_windows": self.config.k_windows,
@@ -221,6 +257,7 @@ class ErrorRateDetector(BaseDetector):
                             "window_total": state.window_total,
                             "window_errors": state.window_errors,
                             "history_length": len(state.history),
+                            "effective_threshold": effective_threshold,
                         }
                     )
                     self._publish_alert(alert)
@@ -250,16 +287,21 @@ class ErrorRateDetector(BaseDetector):
         if len(state.history) >= 1:
             z_score = calculate_modified_z_score(state.history, error_rate)
 
-            if z_score > self.config.z_score_threshold:
+            base_threshold = self.config.z_score_threshold
+            if base_threshold == 'auto':
+                base_threshold = self.config.initial_z_score_threshold
+            effective_threshold = self.get_effective_threshold(source, base_threshold)
+
+            if z_score > effective_threshold:
                 alert = AlertEvent(
                     severity=AlertSeverity.WARNING,
                     alert_type=AlertType.ERROR_RATE_SURGE,
                     source=source,
                     detector=DetectorName.ERROR_RATE,
                     trigger_value=error_rate,
-                    threshold=self.config.z_score_threshold,
+                    threshold=effective_threshold,
                     baseline_value=float('inf') if z_score == float('inf') else None,
-                    description=f"Error rate surge detected: {error_rate:.4f} has Z-score {z_score:.4f} > threshold {self.config.z_score_threshold}",
+                    description=f"Error rate surge detected: {error_rate:.4f} has Z-score {z_score:.4f} > threshold {effective_threshold:.2f}",
                     extra={
                         "window_size_seconds": self.config.window_size_seconds,
                         "k_windows": self.config.k_windows,
@@ -267,6 +309,7 @@ class ErrorRateDetector(BaseDetector):
                         "window_total": state.window_total,
                         "window_errors": state.window_errors,
                         "history_length": len(state.history),
+                        "effective_threshold": effective_threshold,
                     }
                 )
                 self._publish_alert(alert)

@@ -4,7 +4,17 @@ import yaml
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, Pattern
 from datetime import datetime
-from .models import LogFormat, LogLevel, SanitizeStrategy, SensitiveType
+from .models import (
+    LogFormat,
+    LogLevel,
+    SanitizeStrategy,
+    SensitiveType,
+    AlertType,
+    AlertSeverity,
+    SuppressionAction,
+    SuppressionRule,
+    SuppressionRuleMatch,
+)
 
 
 @dataclass
@@ -104,14 +114,32 @@ class AuditLogConfig:
 class FrequencyAlgorithmConfig:
     window_size_seconds: int = 300
     alpha: float = 0.3
-    threshold_multiplier: float = 3.0
+    threshold_multiplier: Any = 3.0
+    weight: float = 1.0
+    initial_threshold_multiplier: float = 3.0
+
+    def __post_init__(self):
+        if isinstance(self.threshold_multiplier, str) and self.threshold_multiplier.lower() == 'auto':
+            self.threshold_multiplier = 'auto'
+        else:
+            self.threshold_multiplier = float(self.threshold_multiplier)
+            self.initial_threshold_multiplier = self.threshold_multiplier
 
 
 @dataclass
 class ErrorRateAlgorithmConfig:
     window_size_seconds: int = 300
     k_windows: int = 20
-    z_score_threshold: float = 2.5
+    z_score_threshold: Any = 2.5
+    weight: float = 1.0
+    initial_z_score_threshold: float = 2.5
+
+    def __post_init__(self):
+        if isinstance(self.z_score_threshold, str) and self.z_score_threshold.lower() == 'auto':
+            self.z_score_threshold = 'auto'
+        else:
+            self.z_score_threshold = float(self.z_score_threshold)
+            self.initial_z_score_threshold = self.z_score_threshold
 
 
 @dataclass
@@ -119,6 +147,7 @@ class PatternAlgorithmConfig:
     window_size_seconds: int = 300
     min_samples: int = 100
     disappear_windows: int = 3
+    weight: float = 1.0
 
 
 @dataclass
@@ -148,6 +177,9 @@ class AnomalyDetectionConfig:
     state_file: Optional[str] = None
     suppression_window_seconds: int = 600
     correlation_window_seconds: int = 30
+    suppression_rules: List[SuppressionRule] = field(default_factory=list)
+    feedback_file: Optional[str] = None
+    max_resolved_alerts: int = 100
 
 
 @dataclass
@@ -369,8 +401,14 @@ class ConfigLoader:
                 state_file=anomaly_data.get('state_file'),
                 suppression_window_seconds=anomaly_data.get('suppression_window_seconds', 600),
                 correlation_window_seconds=anomaly_data.get('correlation_window_seconds', 30),
+                feedback_file=anomaly_data.get('feedback_file'),
+                max_resolved_alerts=anomaly_data.get('max_resolved_alerts', 100),
             )
-            
+
+            suppression_rules_data = anomaly_data.get('suppression_rules', [])
+            if suppression_rules_data:
+                ad_config.suppression_rules = ConfigLoader._parse_suppression_rules(suppression_rules_data)
+
             algos_data = anomaly_data.get('algorithms', {})
             if algos_data:
                 freq_data = algos_data.get('frequency', {})
@@ -378,22 +416,25 @@ class ConfigLoader:
                     window_size_seconds=freq_data.get('window_size_seconds', 300),
                     alpha=freq_data.get('alpha', 0.3),
                     threshold_multiplier=freq_data.get('threshold_multiplier', 3.0),
+                    weight=float(freq_data.get('weight', 1.0)),
                 )
-                
+
                 err_data = algos_data.get('error_rate', {})
                 ad_config.algorithms.error_rate = ErrorRateAlgorithmConfig(
                     window_size_seconds=err_data.get('window_size_seconds', 300),
                     k_windows=err_data.get('k_windows', 20),
                     z_score_threshold=err_data.get('z_score_threshold', 2.5),
+                    weight=float(err_data.get('weight', 1.0)),
                 )
-                
+
                 pat_data = algos_data.get('pattern', {})
                 ad_config.algorithms.pattern = PatternAlgorithmConfig(
                     window_size_seconds=pat_data.get('window_size_seconds', 300),
                     min_samples=pat_data.get('min_samples', 100),
                     disappear_windows=pat_data.get('disappear_windows', 3),
+                    weight=float(pat_data.get('weight', 1.0)),
                 )
-            
+
             webhook_data = anomaly_data.get('webhook', {})
             if webhook_data:
                 ad_config.webhook = WebhookConfig(
@@ -404,10 +445,53 @@ class ConfigLoader:
                     retry_interval_seconds=webhook_data.get('retry_interval_seconds', 1),
                     dead_letter_file=webhook_data.get('dead_letter_file'),
                 )
-            
+
             pipeline.anomaly_detection = ad_config
-        
+
         return pipeline
+
+    @staticmethod
+    def _parse_suppression_rules(rules_data: List[Dict[str, Any]]) -> List[SuppressionRule]:
+        rules = []
+        for idx, rule_data in enumerate(rules_data):
+            match_data = rule_data.get('match', {})
+            action_str = rule_data.get('action', 'suppress')
+
+            try:
+                action = SuppressionAction(action_str.lower())
+            except ValueError:
+                raise ValueError(f"Invalid suppression action '{action_str}' at index {idx}")
+
+            alert_types = None
+            if 'alert_types' in match_data:
+                try:
+                    alert_types = [AlertType(t.lower()) for t in match_data['alert_types']]
+                except ValueError as e:
+                    raise ValueError(f"Invalid alert_type in suppression rule {idx}: {e}")
+
+            severities = None
+            if 'severities' in match_data:
+                try:
+                    severities = [AlertSeverity(s.upper()) for s in match_data['severities']]
+                except ValueError as e:
+                    raise ValueError(f"Invalid severity in suppression rule {idx}: {e}")
+
+            match = SuppressionRuleMatch(
+                source_pattern=match_data.get('source_pattern'),
+                alert_types=alert_types,
+                severities=severities,
+                cron_expression=match_data.get('cron_expression'),
+            )
+
+            rule = SuppressionRule(
+                name=rule_data.get('name', f"rule_{idx}"),
+                match=match,
+                action=action,
+                enabled=rule_data.get('enabled', True),
+                delay_seconds=int(rule_data.get('delay_seconds', 0)),
+            )
+            rules.append(rule)
+        return rules
 
     @staticmethod
     def _validate_custom_rule(rule: SanitizerRuleConfig) -> None:

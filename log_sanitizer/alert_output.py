@@ -39,6 +39,21 @@ class AlertOutput:
         if alert.severity == AlertSeverity.CRITICAL and self.webhook_config.url:
             self._send_webhook(alert)
 
+    def send_status_change(self, alert: AlertEvent, old_status, new_status) -> None:
+        if not self.webhook_config.url:
+            return
+
+        status_data = {
+            "type": "status_change",
+            "alert_id": alert.id,
+            "old_status": old_status.value if hasattr(old_status, 'value') else str(old_status),
+            "new_status": new_status.value if hasattr(new_status, 'value') else str(new_status),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "alert": alert.to_dict(),
+        }
+
+        self._send_webhook_json(status_data)
+
     def _write_to_file(self, alert: AlertEvent) -> None:
         if not self.alert_file:
             return
@@ -58,6 +73,18 @@ class AlertOutput:
             return
 
         alert_json = json.dumps(alert.to_dict(), ensure_ascii=False).encode('utf-8')
+        self._send_webhook_raw(alert_json, alert)
+
+    def _send_webhook_json(self, data: Dict[str, Any]) -> None:
+        if not self.webhook_config.url:
+            return
+
+        json_bytes = json.dumps(data, ensure_ascii=False).encode('utf-8')
+        self._send_webhook_raw(json_bytes, None)
+
+    def _send_webhook_raw(self, payload: bytes, alert: Optional[AlertEvent]) -> None:
+        if not self.webhook_config.url:
+            return
 
         max_retries = self.webhook_config.max_retries
         retry_interval = self.webhook_config.retry_interval_seconds
@@ -73,7 +100,7 @@ class AlertOutput:
 
                 req = urllib.request.Request(
                     self.webhook_config.url,
-                    data=alert_json,
+                    data=payload,
                     headers=headers,
                     method='POST'
                 )
@@ -92,7 +119,10 @@ class AlertOutput:
 
         if last_error:
             print(f"Failed to send webhook after {max_retries + 1} attempts: {last_error}", flush=True)
-            self._write_to_dead_letter(alert, last_error)
+            if alert is not None:
+                self._write_to_dead_letter(alert, last_error)
+            else:
+                self._write_status_to_dead_letter(payload, last_error)
 
     def _write_to_dead_letter(self, alert: AlertEvent, error: str) -> None:
         dead_letter_file = self.webhook_config.dead_letter_file
@@ -115,6 +145,34 @@ class AlertOutput:
                 f.write(json.dumps(dead_letter_entry, ensure_ascii=False) + '\n')
         except Exception as e:
             print(f"Error writing to dead letter file: {e}", flush=True)
+
+    def _write_status_to_dead_letter(self, payload: bytes, error: str) -> None:
+        dead_letter_file = self.webhook_config.dead_letter_file
+        if not dead_letter_file:
+            return
+
+        try:
+            dead_letter_dir = os.path.dirname(os.path.abspath(dead_letter_file))
+            if dead_letter_dir:
+                os.makedirs(dead_letter_dir, exist_ok=True)
+
+            try:
+                payload_dict = json.loads(payload.decode('utf-8'))
+            except:
+                payload_dict = {'raw_payload': payload.decode('utf-8', errors='replace')}
+
+            dead_letter_entry = {
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'type': 'status_change',
+                'error': error,
+                'payload': payload_dict,
+                'webhook_url': self.webhook_config.url,
+            }
+
+            with open(dead_letter_file, 'a', encoding='utf-8', buffering=1) as f:
+                f.write(json.dumps(dead_letter_entry, ensure_ascii=False) + '\n')
+        except Exception as e:
+            print(f"Error writing status to dead letter file: {e}", flush=True)
 
     def close(self) -> None:
         with self._lock:
