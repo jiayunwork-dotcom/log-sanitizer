@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, Dict, Any, List, Pattern, Tuple
@@ -191,6 +192,22 @@ class AlertEvent:
     description: str = ""
     extra: Dict[str, Any] = field(default_factory=dict)
 
+    @staticmethod
+    def _sanitize_float(value: Any) -> Any:
+        if isinstance(value, float):
+            if math.isinf(value) or math.isnan(value):
+                return None
+        return value
+
+    @classmethod
+    def _sanitize_value(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {k: cls._sanitize_value(v) for k, v in value.items()}
+        elif isinstance(value, list):
+            return [cls._sanitize_value(v) for v in value]
+        else:
+            return cls._sanitize_float(value)
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "id": self.id,
@@ -199,12 +216,12 @@ class AlertEvent:
             "alert_type": self.alert_type.value,
             "source": self.source,
             "detector": self.detector.value,
-            "trigger_value": self.trigger_value,
-            "threshold": self.threshold,
-            "baseline_value": self.baseline_value,
+            "trigger_value": self._sanitize_float(self.trigger_value),
+            "threshold": self._sanitize_float(self.threshold),
+            "baseline_value": self._sanitize_float(self.baseline_value),
             "line_range": list(self.line_range) if self.line_range else None,
             "description": self.description,
-            "extra": self.extra,
+            "extra": self._sanitize_value(self.extra),
         }
 
 

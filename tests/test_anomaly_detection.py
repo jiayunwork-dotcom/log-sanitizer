@@ -155,6 +155,17 @@ class TestTemplatizeMessage:
     def test_path_var_replacement(self):
         result = templatize_message("GET /api/users/123/profile")
         assert "<VAR>" in result
+        assert "/api/users/<VAR>/profile" in result
+
+    def test_path_uuid_var_replacement(self):
+        result = templatize_message("GET /api/users/550e8400-e29b-41d4-a716-446655440000/profile")
+        assert "<VAR>" in result
+        assert "/api/users/<VAR>/profile" in result
+        assert "<UUID>" not in result
+
+    def test_path_mixed_vars_replacement(self):
+        result = templatize_message("GET /api/org/123/users/550e8400-e29b-41d4-a716-446655440000/orders/456")
+        assert "/api/org/<VAR>/users/<VAR>/orders/<VAR>" in result
 
     def test_multiple_patterns(self):
         result = templatize_message("User 123 from 10.0.0.1 emailed admin@test.com")
@@ -806,3 +817,129 @@ anomaly_detection:
         assert config.anomaly_detection.algorithms.pattern.disappear_windows == 5
         assert config.anomaly_detection.webhook.url == "http://example.com/alerts"
         assert config.anomaly_detection.webhook.headers["Authorization"] == "Bearer token"
+
+
+class TestBugFixes:
+    def test_json_source_field_extraction(self):
+        from log_sanitizer.parser import LogParser
+
+        parser = LogParser(format=LogFormat.JSON, source="/var/log/app.log")
+        line = '{"timestamp": "2024-01-01T10:00:00Z", "level": "INFO", "source": "api-server", "message": "test"}'
+
+        entry = parser.parse_line(line)
+
+        assert entry.source == "api-server"
+        assert "source" not in entry.extra
+
+    def test_json_logger_field_extraction(self):
+        from log_sanitizer.parser import LogParser
+
+        parser = LogParser(format=LogFormat.JSON, source="/var/log/app.log")
+        line = '{"timestamp": "2024-01-01T10:00:00Z", "level": "INFO", "logger": "PaymentService", "message": "test"}'
+
+        entry = parser.parse_line(line)
+
+        assert entry.source == "PaymentService"
+        assert "logger" not in entry.extra
+
+    def test_json_no_source_field_uses_file_path(self):
+        from log_sanitizer.parser import LogParser
+
+        parser = LogParser(format=LogFormat.JSON, source="/var/log/app.log")
+        line = '{"timestamp": "2024-01-01T10:00:00Z", "level": "INFO", "message": "test"}'
+
+        entry = parser.parse_line(line)
+
+        assert entry.source == "/var/log/app.log"
+
+    def test_infinity_serialized_as_null(self):
+        import math
+
+        alert = AlertEvent(
+            source="test",
+            alert_type=AlertType.ERROR_RATE_SURGE,
+            trigger_value=1.0,
+            threshold=2.5,
+            baseline_value=float('inf'),
+            description="test",
+            extra={
+                "z_score": float('inf'),
+                "nested": {
+                    "value": float('nan'),
+                }
+            }
+        )
+
+        data = alert.to_dict()
+        json_str = json.dumps(data)
+        parsed = json.loads(json_str)
+
+        assert parsed["baseline_value"] is None
+        assert parsed["extra"]["z_score"] is None
+        assert parsed["extra"]["nested"]["value"] is None
+
+    def test_normal_float_not_affected(self):
+        alert = AlertEvent(
+            source="test",
+            alert_type=AlertType.FREQUENCY_SPIKE,
+            trigger_value=10.5,
+            threshold=5.0,
+            baseline_value=3.5,
+            description="test",
+        )
+
+        data = alert.to_dict()
+
+        assert data["trigger_value"] == 10.5
+        assert data["threshold"] == 5.0
+        assert data["baseline_value"] == 3.5
+
+    def test_detectors_use_json_source_not_file_path(self):
+        config = FrequencyAlgorithmConfig(window_size_seconds=1, alpha=0.3, threshold_multiplier=3.0)
+        bus = EventBus()
+        detector = FrequencyDetector(config, bus)
+
+        alerts = []
+        def on_alert(event):
+            alerts.append(event)
+        bus.subscribe('*', on_alert)
+
+        base_time = datetime.now(timezone.utc)
+
+        for i in range(5):
+            entry = LogEntry(
+                raw="test",
+                source="api-server",
+                format=LogFormat.JSON,
+                timestamp=base_time + timedelta(seconds=i * 0.2),
+                level=LogLevel.INFO,
+                message="test",
+                is_parseable=True,
+            )
+            detector.process_entry(entry)
+
+        for i in range(5):
+            entry = LogEntry(
+                raw="test",
+                source="payment-service",
+                format=LogFormat.JSON,
+                timestamp=base_time + timedelta(seconds=i * 0.2),
+                level=LogLevel.INFO,
+                message="test",
+                is_parseable=True,
+            )
+            detector.process_entry(entry)
+
+        assert "api-server" in detector.states
+        assert "payment-service" in detector.states
+        assert len(detector.states) == 2
+
+    def test_path_var_and_uuid_consistent(self):
+        result1 = templatize_message("GET /api/users/12345/profile")
+        result2 = templatize_message("GET /api/users/550e8400-e29b-41d4-a716-446655440000/profile")
+
+        assert result1 == "GET /api/users/<VAR>/profile"
+        assert result2 == "GET /api/users/<VAR>/profile"
+
+        assert "<NUM>" not in result1
+        assert "<UUID>" not in result2

@@ -26,7 +26,7 @@ IPV6_PATTERN = r'\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b|\b(?:[0-9a-fA-F]{1
 EMAIL_PATTERN = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
 UUID_PATTERN = r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b'
 NUM_PATTERN = r'\b\d+\b'
-PATH_VAR_PATTERN = r'/\d+(?:/|$)'
+PATH_VAR_SEGMENT_PATTERN = r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$|^\d+$'
 
 
 class BaseDetector:
@@ -293,16 +293,41 @@ class ErrorRateDetector(BaseDetector):
         self.states[source] = state
 
 
+def _is_path_variable(segment: str) -> bool:
+    if not segment:
+        return False
+    if re.match(PATH_VAR_SEGMENT_PATTERN, segment):
+        return True
+    return False
+
+
+def _templatize_path(message: str) -> str:
+    def replace_path(match: re.Match) -> str:
+        path = match.group(0)
+        segments = path.split('/')
+        new_segments = []
+        for seg in segments:
+            if _is_path_variable(seg):
+                new_segments.append('<VAR>')
+            else:
+                new_segments.append(seg)
+        return '/'.join(new_segments)
+    
+    path_pattern = r'(?:/[^\s/]+)+'
+    return re.sub(path_pattern, replace_path, message)
+
+
 def templatize_message(message: str) -> str:
     template = message
 
     template = re.sub(EMAIL_PATTERN, '<EMAIL>', template)
-    template = re.sub(UUID_PATTERN, '<UUID>', template)
     template = re.sub(IPV6_PATTERN, '<IP>', template)
     template = re.sub(IPV4_PATTERN, '<IP>', template)
-    template = re.sub(PATH_VAR_PATTERN, '/<VAR>/', template)
+
+    template = _templatize_path(template)
+
+    template = re.sub(UUID_PATTERN, '<UUID>', template)
     template = re.sub(NUM_PATTERN, '<NUM>', template)
-    template = re.sub(r'/(<VAR>)/+', r'/\1/', template)
 
     return template
 

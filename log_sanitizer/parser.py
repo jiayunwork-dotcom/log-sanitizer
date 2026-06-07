@@ -134,7 +134,11 @@ class LogParser:
             if message:
                 entry.message = message
             
-            standard_fields = {'timestamp', 'time', 'date', 'level', 'log_level', 'severity', 'message', 'msg', 'content'}
+            source = self._extract_source(data)
+            if source:
+                entry.source = source
+            
+            standard_fields = {'timestamp', 'time', 'date', 'level', 'log_level', 'severity', 'message', 'msg', 'content', 'source', 'logger', 'module', 'app', 'service'}
             entry.extra = {k: v for k, v in data.items() if k.lower() not in standard_fields}
             
             entry.is_parseable = True
@@ -168,6 +172,13 @@ class LogParser:
             if field in data and data[field]:
                 return str(data[field])
         return json.dumps(data, ensure_ascii=False)
+
+    def _extract_source(self, data: Dict[str, Any]) -> Optional[str]:
+        source_fields = ['source', 'logger', 'module', 'app', 'service']
+        for field in source_fields:
+            if field in data and data[field]:
+                return str(data[field])
+        return None
 
     def _parse_apache_nginx(self, line: str, entry: LogEntry) -> LogEntry:
         match = APACHE_COMBINED_PATTERN.match(line)
