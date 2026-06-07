@@ -234,6 +234,7 @@ class SuppressionRule:
 class PendingAlert:
     alert: AlertEvent
     rule_name: str
+    delay_seconds: int
     delay_until: datetime
     check_alert_type: AlertType
     check_source: str
@@ -295,25 +296,55 @@ class AlertEvent:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'AlertEvent':
         from datetime import timezone
+        try:
+            status_str = data.get('status', 'active').lower()
+            status = AlertStatus(status_str)
+        except (ValueError, AttributeError):
+            status = AlertStatus.ACTIVE
+
+        try:
+            severity_str = data.get('severity', 'WARNING').upper()
+            severity = AlertSeverity(severity_str)
+        except (ValueError, AttributeError):
+            severity = AlertSeverity.WARNING
+
+        try:
+            alert_type_str = data.get('alert_type', 'frequency_spike').lower()
+            alert_type = AlertType(alert_type_str)
+        except (ValueError, AttributeError):
+            alert_type = AlertType.FREQUENCY_SPIKE
+
+        try:
+            detector_str = data.get('detector', 'frequency_detector').lower()
+            detector = DetectorName(detector_str)
+        except (ValueError, AttributeError):
+            detector = DetectorName.FREQUENCY
+
         alert = cls(
             id=data.get('id', str(uuid.uuid4())),
             timestamp=datetime.fromisoformat(data['timestamp'].replace('Z', '+00:00')) if data.get('timestamp') else datetime.now(timezone.utc),
-            severity=AlertSeverity(data.get('severity', 'WARNING')),
-            alert_type=AlertType(data.get('alert_type', 'frequency_spike')),
+            severity=severity,
+            alert_type=alert_type,
             source=data.get('source', ''),
-            detector=DetectorName(data.get('detector', 'frequency_detector')),
+            detector=detector,
             trigger_value=float(data.get('trigger_value', 0.0)),
             threshold=float(data.get('threshold', 0.0)),
             baseline_value=float(data['baseline_value']) if data.get('baseline_value') is not None else None,
             line_range=tuple(data['line_range']) if data.get('line_range') else None,
             description=data.get('description', ''),
             extra=data.get('extra', {}),
-            status=AlertStatus(data.get('status', 'active')),
+            status=status,
         )
         if data.get('acknowledged_at'):
-            alert.acknowledged_at = datetime.fromisoformat(data['acknowledged_at'].replace('Z', '+00:00'))
+            try:
+                alert.acknowledged_at = datetime.fromisoformat(data['acknowledged_at'].replace('Z', '+00:00'))
+            except (ValueError, TypeError):
+                pass
         if data.get('resolved_at'):
-            alert.resolved_at = datetime.fromisoformat(data['resolved_at'].replace('Z', '+00:00'))
+            try:
+                alert.resolved_at = datetime.fromisoformat(data['resolved_at'].replace('Z', '+00:00'))
+            except (ValueError, TypeError):
+                pass
         return alert
 
 
@@ -413,11 +444,20 @@ class AnomalyDetectionState:
         if data.get('last_updated'):
             state.last_updated = datetime.fromisoformat(data['last_updated'].replace('Z', '+00:00'))
         for alert_id, alert_data in data.get('active_alerts', {}).items():
-            state.active_alerts[alert_id] = AlertEvent.from_dict(alert_data)
+            try:
+                state.active_alerts[alert_id] = AlertEvent.from_dict(alert_data)
+            except Exception as e:
+                print(f"Warning: Failed to load active alert {alert_id}: {e}", flush=True)
         for alert_id, alert_data in data.get('acknowledged_alerts', {}).items():
-            state.acknowledged_alerts[alert_id] = AlertEvent.from_dict(alert_data)
+            try:
+                state.acknowledged_alerts[alert_id] = AlertEvent.from_dict(alert_data)
+            except Exception as e:
+                print(f"Warning: Failed to load acknowledged alert {alert_id}: {e}", flush=True)
         for alert_data in data.get('resolved_alerts', []):
-            state.resolved_alerts.append(AlertEvent.from_dict(alert_data))
+            try:
+                state.resolved_alerts.append(AlertEvent.from_dict(alert_data))
+            except Exception as e:
+                print(f"Warning: Failed to load resolved alert: {e}", flush=True)
         return state
 
 

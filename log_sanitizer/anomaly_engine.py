@@ -337,6 +337,7 @@ class AnomalyDetectionEngine:
             },
             "alert_status_counts": alert_status_counts,
             "suppression_rules": suppression_rules_stats,
+            "threshold_overrides": self.feedback_processor.get_threshold_overrides() if self.feedback_processor else {},
             "state_file": self.config.state_file,
             "alert_file": self.config.alert_file,
             "feedback_file": self.config.feedback_file,

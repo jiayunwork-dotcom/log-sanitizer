@@ -109,6 +109,7 @@ class SuppressionEngine:
                         pending = PendingAlert(
                             alert=alert,
                             rule_name=rule.name,
+                            delay_seconds=rule.delay_seconds,
                             delay_until=delay_until,
                             check_alert_type=alert.alert_type,
                             check_source=alert.source,
@@ -138,7 +139,7 @@ class SuppressionEngine:
     def _process_expired_pending(self, pending: PendingAlert) -> None:
         source = pending.check_source
         alert_type = pending.check_alert_type
-        delay_seconds = pending.rule.delay_seconds if hasattr(pending.rule, 'delay_seconds') else 0
+        delay_seconds = pending.delay_seconds
 
         recent = self._recent_alerts.get((source, alert_type), [])
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=delay_seconds)
