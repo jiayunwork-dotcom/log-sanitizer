@@ -18,6 +18,7 @@ from .mapping_manager import MappingManager
 from .report import ReportAccumulator, ReportGenerator
 from .state_manager import StateManager
 from .audit_logger import AuditLogger
+from .anomaly_engine import AnomalyDetectionEngine
 
 
 class LogProcessor:
@@ -29,8 +30,10 @@ class LogProcessor:
         self._output_handles: Dict[str, io.TextIOWrapper] = {}
         self.state_manager: Optional[StateManager] = None
         self.audit_logger: Optional[AuditLogger] = None
+        self.anomaly_engine: Optional[AnomalyDetectionEngine] = None
         self._config_mtime: Optional[float] = None
         self._hot_reload_enabled = False
+        self._current_line_number: int = 0
         
         if self.config.incremental and self.config.state_file:
             self.state_manager = StateManager(self.config.state_file)
@@ -40,6 +43,10 @@ class LogProcessor:
                 self.config.audit_log.file,
                 self.config.audit_log.enabled,
             )
+        
+        if self.config.anomaly_detection.enabled:
+            self.anomaly_engine = AnomalyDetectionEngine(self.config.anomaly_detection)
+            self.anomaly_engine.start()
         
         if self.config.config_path and os.path.exists(self.config.config_path):
             try:
@@ -345,6 +352,7 @@ class LogProcessor:
                 stats.total_lines += 1
                 stats.bytes_processed += line_bytes
                 lines_processed += 1
+                self._current_line_number = initial_lines + lines_processed
                 pbar.update(1)
                 
                 if lines_processed % 1000 == 0:
@@ -366,6 +374,9 @@ class LogProcessor:
             if self.state_manager:
                 self.state_manager.update_file_state(file_path, current_offset)
                 self.state_manager.save()
+            
+            if self.anomaly_engine:
+                self.anomaly_engine.on_file_completed()
         
         return stats, preview_records
 
@@ -404,6 +415,9 @@ class LogProcessor:
     
     def _write_output(self, entry: LogEntry, source_file: str) -> None:
         output = self.config.output
+        
+        if self.anomaly_engine and entry.is_parseable:
+            self.anomaly_engine.process_entry(entry, self._current_line_number, self._current_line_number)
         
         if output.stdout or output.target == 'stdout':
             json_str = json.dumps(entry.to_standard_dict(), ensure_ascii=False)
@@ -444,6 +458,8 @@ class LogProcessor:
             self.state_manager.close()
         if self.audit_logger:
             self.audit_logger.close()
+        if self.anomaly_engine:
+            self.anomaly_engine.stop()
 
     def run(self, show_progress: bool = True) -> AuditReport:
         files = self.discover_files()
@@ -602,6 +618,39 @@ class LogProcessor:
             "audit_log": {
                 "enabled": self.config.audit_log.enabled,
                 "file": self.config.audit_log.file,
+            },
+            "anomaly_detection": {
+                "enabled": self.config.anomaly_detection.enabled,
+                "alert_file": self.config.anomaly_detection.alert_file,
+                "min_samples": self.config.anomaly_detection.min_samples,
+                "state_file": self.config.anomaly_detection.state_file,
+                "suppression_window_seconds": self.config.anomaly_detection.suppression_window_seconds,
+                "correlation_window_seconds": self.config.anomaly_detection.correlation_window_seconds,
+                "algorithms": {
+                    "frequency": {
+                        "window_size_seconds": self.config.anomaly_detection.algorithms.frequency.window_size_seconds,
+                        "alpha": self.config.anomaly_detection.algorithms.frequency.alpha,
+                        "threshold_multiplier": self.config.anomaly_detection.algorithms.frequency.threshold_multiplier,
+                    },
+                    "error_rate": {
+                        "window_size_seconds": self.config.anomaly_detection.algorithms.error_rate.window_size_seconds,
+                        "k_windows": self.config.anomaly_detection.algorithms.error_rate.k_windows,
+                        "z_score_threshold": self.config.anomaly_detection.algorithms.error_rate.z_score_threshold,
+                    },
+                    "pattern": {
+                        "window_size_seconds": self.config.anomaly_detection.algorithms.pattern.window_size_seconds,
+                        "min_samples": self.config.anomaly_detection.algorithms.pattern.min_samples,
+                        "disappear_windows": self.config.anomaly_detection.algorithms.pattern.disappear_windows,
+                    },
+                },
+                "webhook": {
+                    "url": self.config.anomaly_detection.webhook.url,
+                    "headers": self.config.anomaly_detection.webhook.headers,
+                    "timeout_seconds": self.config.anomaly_detection.webhook.timeout_seconds,
+                    "max_retries": self.config.anomaly_detection.webhook.max_retries,
+                    "retry_interval_seconds": self.config.anomaly_detection.webhook.retry_interval_seconds,
+                    "dead_letter_file": self.config.anomaly_detection.webhook.dead_letter_file,
+                },
             },
         }
 

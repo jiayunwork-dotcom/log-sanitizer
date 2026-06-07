@@ -1,7 +1,8 @@
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, Dict, Any, List, Pattern
-from datetime import datetime
+from typing import Optional, Dict, Any, List, Pattern, Tuple
+from datetime import datetime, timezone
+import uuid
 
 
 class LogLevel(str, Enum):
@@ -153,3 +154,133 @@ class AuditReport:
     field_path_counts: Dict[str, int] = field(default_factory=dict)
     skipped_files: List[str] = field(default_factory=list)
     incremental_mode: bool = False
+
+
+class AlertSeverity(str, Enum):
+    INFO = "INFO"
+    WARNING = "WARNING"
+    CRITICAL = "CRITICAL"
+
+
+class AlertType(str, Enum):
+    FREQUENCY_SPIKE = "frequency_spike"
+    ERROR_RATE_SURGE = "error_rate_surge"
+    NEW_PATTERN = "new_pattern"
+    PATTERN_DISAPPEARED = "pattern_disappeared"
+    COMPOSITE_ANOMALY = "composite_anomaly"
+
+
+class DetectorName(str, Enum):
+    FREQUENCY = "frequency_detector"
+    ERROR_RATE = "error_rate_detector"
+    PATTERN = "pattern_detector"
+
+
+@dataclass
+class AlertEvent:
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    severity: AlertSeverity = AlertSeverity.WARNING
+    alert_type: AlertType = AlertType.FREQUENCY_SPIKE
+    source: str = ""
+    detector: DetectorName = DetectorName.FREQUENCY
+    trigger_value: float = 0.0
+    threshold: float = 0.0
+    baseline_value: Optional[float] = None
+    line_range: Optional[Tuple[int, int]] = None
+    description: str = ""
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "timestamp": self.timestamp.isoformat(),
+            "severity": self.severity.value,
+            "alert_type": self.alert_type.value,
+            "source": self.source,
+            "detector": self.detector.value,
+            "trigger_value": self.trigger_value,
+            "threshold": self.threshold,
+            "baseline_value": self.baseline_value,
+            "line_range": list(self.line_range) if self.line_range else None,
+            "description": self.description,
+            "extra": self.extra,
+        }
+
+
+@dataclass
+class FrequencyState:
+    ewma: Optional[float] = None
+    window_start: Optional[datetime] = None
+    window_count: int = 0
+    last_update: Optional[datetime] = None
+
+
+@dataclass
+class ErrorRateState:
+    history: List[float] = field(default_factory=list)
+    window_start: Optional[datetime] = None
+    window_total: int = 0
+    window_errors: int = 0
+
+
+@dataclass
+class PatternState:
+    known_templates: Dict[str, int] = field(default_factory=dict)
+    template_last_seen: Dict[str, datetime] = field(default_factory=dict)
+    window_start: Optional[datetime] = None
+    windows_without: Dict[str, int] = field(default_factory=dict)
+    total_count: int = 0
+
+
+@dataclass
+class AnomalyDetectionState:
+    version: str = "1.0"
+    frequency_states: Dict[str, FrequencyState] = field(default_factory=dict)
+    error_rate_states: Dict[str, ErrorRateState] = field(default_factory=dict)
+    pattern_states: Dict[str, PatternState] = field(default_factory=dict)
+    last_updated: Optional[datetime] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "version": self.version,
+            "last_updated": self.last_updated.isoformat() if self.last_updated else None,
+            "frequency_states": {
+                source: {
+                    "ewma": fs.ewma,
+                    "window_start": fs.window_start.isoformat() if fs.window_start else None,
+                    "window_count": fs.window_count,
+                    "last_update": fs.last_update.isoformat() if fs.last_update else None,
+                }
+                for source, fs in self.frequency_states.items()
+            },
+            "error_rate_states": {
+                source: {
+                    "history": ers.history,
+                    "window_start": ers.window_start.isoformat() if ers.window_start else None,
+                    "window_total": ers.window_total,
+                    "window_errors": ers.window_errors,
+                }
+                for source, ers in self.error_rate_states.items()
+            },
+            "pattern_states": {
+                source: {
+                    "known_templates": ps.known_templates,
+                    "template_last_seen": {
+                        t: dt.isoformat() for t, dt in ps.template_last_seen.items()
+                    },
+                    "windows_without": ps.windows_without,
+                    "total_count": ps.total_count,
+                }
+                for source, ps in self.pattern_states.items()
+            },
+        }
+
+
+@dataclass
+class AlertStats:
+    total_alerts: int = 0
+    by_severity: Dict[AlertSeverity, int] = field(default_factory=dict)
+    by_type: Dict[AlertType, int] = field(default_factory=dict)
+    by_source: Dict[str, int] = field(default_factory=dict)
+    by_detector: Dict[DetectorName, int] = field(default_factory=dict)

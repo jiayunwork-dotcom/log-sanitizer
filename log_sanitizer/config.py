@@ -101,6 +101,56 @@ class AuditLogConfig:
 
 
 @dataclass
+class FrequencyAlgorithmConfig:
+    window_size_seconds: int = 300
+    alpha: float = 0.3
+    threshold_multiplier: float = 3.0
+
+
+@dataclass
+class ErrorRateAlgorithmConfig:
+    window_size_seconds: int = 300
+    k_windows: int = 20
+    z_score_threshold: float = 2.5
+
+
+@dataclass
+class PatternAlgorithmConfig:
+    window_size_seconds: int = 300
+    min_samples: int = 100
+    disappear_windows: int = 3
+
+
+@dataclass
+class AnomalyDetectionAlgorithmsConfig:
+    frequency: FrequencyAlgorithmConfig = field(default_factory=FrequencyAlgorithmConfig)
+    error_rate: ErrorRateAlgorithmConfig = field(default_factory=ErrorRateAlgorithmConfig)
+    pattern: PatternAlgorithmConfig = field(default_factory=PatternAlgorithmConfig)
+
+
+@dataclass
+class WebhookConfig:
+    url: Optional[str] = None
+    headers: Dict[str, str] = field(default_factory=dict)
+    timeout_seconds: int = 5
+    max_retries: int = 2
+    retry_interval_seconds: int = 1
+    dead_letter_file: Optional[str] = None
+
+
+@dataclass
+class AnomalyDetectionConfig:
+    enabled: bool = False
+    algorithms: AnomalyDetectionAlgorithmsConfig = field(default_factory=AnomalyDetectionAlgorithmsConfig)
+    alert_file: Optional[str] = None
+    webhook: WebhookConfig = field(default_factory=WebhookConfig)
+    min_samples: int = 100
+    state_file: Optional[str] = None
+    suppression_window_seconds: int = 600
+    correlation_window_seconds: int = 30
+
+
+@dataclass
 class PipelineConfig:
     name: str = "default"
     inputs: InputConfig = field(default_factory=InputConfig)
@@ -115,6 +165,7 @@ class PipelineConfig:
     state_file: Optional[str] = None
     incremental: bool = False
     audit_log: AuditLogConfig = field(default_factory=AuditLogConfig)
+    anomaly_detection: AnomalyDetectionConfig = field(default_factory=AnomalyDetectionConfig)
     config_path: Optional[str] = None
 
 
@@ -308,6 +359,53 @@ class ConfigLoader:
         
         if not pipeline.output.file and not pipeline.output.stdout:
             raise ValueError("No output destination specified (file or stdout)")
+        
+        anomaly_data = config_data.get('anomaly_detection', {})
+        if anomaly_data:
+            ad_config = AnomalyDetectionConfig(
+                enabled=anomaly_data.get('enabled', False),
+                alert_file=anomaly_data.get('alert_file'),
+                min_samples=anomaly_data.get('min_samples', 100),
+                state_file=anomaly_data.get('state_file'),
+                suppression_window_seconds=anomaly_data.get('suppression_window_seconds', 600),
+                correlation_window_seconds=anomaly_data.get('correlation_window_seconds', 30),
+            )
+            
+            algos_data = anomaly_data.get('algorithms', {})
+            if algos_data:
+                freq_data = algos_data.get('frequency', {})
+                ad_config.algorithms.frequency = FrequencyAlgorithmConfig(
+                    window_size_seconds=freq_data.get('window_size_seconds', 300),
+                    alpha=freq_data.get('alpha', 0.3),
+                    threshold_multiplier=freq_data.get('threshold_multiplier', 3.0),
+                )
+                
+                err_data = algos_data.get('error_rate', {})
+                ad_config.algorithms.error_rate = ErrorRateAlgorithmConfig(
+                    window_size_seconds=err_data.get('window_size_seconds', 300),
+                    k_windows=err_data.get('k_windows', 20),
+                    z_score_threshold=err_data.get('z_score_threshold', 2.5),
+                )
+                
+                pat_data = algos_data.get('pattern', {})
+                ad_config.algorithms.pattern = PatternAlgorithmConfig(
+                    window_size_seconds=pat_data.get('window_size_seconds', 300),
+                    min_samples=pat_data.get('min_samples', 100),
+                    disappear_windows=pat_data.get('disappear_windows', 3),
+                )
+            
+            webhook_data = anomaly_data.get('webhook', {})
+            if webhook_data:
+                ad_config.webhook = WebhookConfig(
+                    url=webhook_data.get('url'),
+                    headers=webhook_data.get('headers', {}),
+                    timeout_seconds=webhook_data.get('timeout_seconds', 5),
+                    max_retries=webhook_data.get('max_retries', 2),
+                    retry_interval_seconds=webhook_data.get('retry_interval_seconds', 1),
+                    dead_letter_file=webhook_data.get('dead_letter_file'),
+                )
+            
+            pipeline.anomaly_detection = ad_config
         
         return pipeline
 

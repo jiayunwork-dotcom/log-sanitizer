@@ -126,3 +126,36 @@ audit_log:
 # 审计报告配置
 report_file: "./output/audit_report.txt"
 report_json: "./output/audit_report.json"
+
+# 异常检测配置
+anomaly_detection:
+  enabled: false
+  alert_file: "./output/alerts.jsonl"
+  min_samples: 100
+  state_file: "./output/.anomaly_state.json"
+  suppression_window_seconds: 600
+  correlation_window_seconds: 30
+
+  algorithms:
+    frequency:
+      window_size_seconds: 300
+      alpha: 0.3
+      threshold_multiplier: 3.0
+
+    error_rate:
+      window_size_seconds: 300
+      k_windows: 20
+      z_score_threshold: 2.5
+
+    pattern:
+      window_size_seconds: 300
+      min_samples: 100
+      disappear_windows: 3
+
+  webhook:
+    url: null
+    headers: {}
+    timeout_seconds: 5
+    max_retries: 2
+    retry_interval_seconds: 1
+    dead_letter_file: "./output/webhook_dead_letter.jsonl"
